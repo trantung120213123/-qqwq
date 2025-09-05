@@ -41,7 +41,7 @@ function generateRandomKey(length = 5) {
 // API tạo key mới (không cần user_id)
 app.post('/get-key', (req, res) => {
     try {
-        const newKey = generateRandomKey(20);
+        const newKey = generateRandomKey(5);
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
         
         // Tạo key mới
