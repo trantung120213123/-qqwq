@@ -10,7 +10,7 @@ app.use(cors());
 app.use(express.json());
 
 // Khởi tạo database
-const db = new sqlite3.Database(':memory:', (err) => {
+const db = new sqlite3.Database('./keys.db', (err) => {
     if (err) {
         console.error('Lỗi kết nối database:', err);
     } else {
