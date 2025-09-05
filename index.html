@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ Thống Key - Roblox</title>
+    <style>
+        :root {
+            --primary: #5865F2;
+            --success: #57F287;
+            --danger: #ED4245;
+            --dark: #2C2F33;
+            --darker: #23272A;
+            --light: #F5F5F5;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background: linear-gradient(135deg, var(--dark), var(--darker));
+            color: var(--light);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background-color: rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 30px;
+            width: 100%;
+            max-width: 500px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        h1 {
+            margin-bottom: 20px;
+            color: var(--primary);
+            font-size: 28px;
+        }
+        
+        p {
+            margin-bottom: 25px;
+            line-height: 1.6;
+        }
+        
+        .key-box {
+            background-color: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .key-text {
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
+            letter-spacing: 1px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn-success {
+            background-color: var(--success);
+        }
+        
+        .btn-icon {
+            margin-right: 8px;
+        }
+        
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .status.success {
+            background-color: rgba(87, 242, 135, 0.2);
+            color: var(--success);
+            display: block;
+        }
+        
+        .status.error {
+            background-color: rgba(237, 66, 69, 0.2);
+            color: var(--danger);
+            display: block;
+        }
+        
+        .instructions {
+            margin-top: 30px;
+            padding: 15px;
+            background-color: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            text-align: left;
+        }
+        
+        .instructions h3 {
+            margin-bottom: 10px;
+            color: var(--primary);
+        }
+        
+        .instructions ol {
+            padding-left: 20px;
+        }
+        
+        .instructions li {
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔑 Hệ Thống Key Roblox</h1>
+        <p>Nhận key để kích hoạt script trong game Roblox. Key có hiệu lực trong 24 giờ.</p>
+        
+        <button id="getKeyBtn" class="btn">
+            <span class="btn-icon">🎮</span> Lấy Key
+        </button>
+        
+        <div id="keyContainer" style="display: none;">
+            <div class="key-box">
+                <span id="keyText" class="key-text"></span>
+                <button id="copyKeyBtn" class="btn btn-success">
+                    <span class="btn-icon">📋</span> Sao chép
+                </button>
+            </div>
+            
+            <div id="statusMessage" class="status"></div>
+        </div>
+        
+        <div class="instructions">
+            <h3>Hướng dẫn sử dụng:</h3>
+            <ol>
+                <li>Nhấn "Lấy Key" để tạo key mới</li>
+                <li>Sao chép key bằng nút "Sao chép"</li>
+                <li>Vào game Roblox, mở GUI và nhập key</li>
+                <li>Nhấn "Check Key" để kích hoạt script</li>
+            </ol>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('getKeyBtn').addEventListener('click', async function() {
+            this.disabled = true;
+            this.innerHTML = '<span class="btn-icon">⏳</span> Đang tạo key...';
+            
+            try {
+                const response = await fetch('http://localhost:3000/get-key', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById('keyText').textContent = data.key;
+                    document.getElementById('keyContainer').style.display = 'block';
+                    
+                    document.getElementById('statusMessage').className = 'status success';
+                    document.getElementById('statusMessage').textContent = 
+                        `Key đã được tạo! Key có hiệu lực đến: ${new Date(data.expires).toLocaleString('vi-VI')}`;
+                } else {
+                    document.getElementById('statusMessage').className = 'status error';
+                    document.getElementById('statusMessage').textContent = data.message || 'Có lỗi xảy ra khi tạo key';
+                }
+            } catch (error) {
+                document.getElementById('statusMessage').className = 'status error';
+                document.getElementById('statusMessage').textContent = 'Không thể kết nối đến server';
+            } finally {
+                this.disabled = false;
+                this.innerHTML = '<span class="btn-icon">🎮</span> Lấy Key';
+            }
+        });
+        
+        document.getElementById('copyKeyBtn').addEventListener('click', function() {
+            const keyText = document.getElementById('keyText').textContent;
+            navigator.clipboard.writeText(keyText).then(() => {
+                const statusMessage = document.getElementById('statusMessage');
+                statusMessage.className = 'status success';
+                statusMessage.textContent = 'Key đã được sao chép vào clipboard!';
+            });
+        });
+    </script>
+</body>
+</html>
