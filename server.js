@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,13 +23,9 @@ db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT UNIQUE NOT NULL,
     user_id TEXT,
-    username TEXT,
-    ip TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME NOT NULL,
-    used BOOLEAN DEFAULT FALSE,
-    used_at DATETIME,
-    used_by TEXT
+    used BOOLEAN DEFAULT FALSE
 )`);
 
 // Hàm tạo key ngẫu nhiên 20 ký tự
@@ -43,65 +38,31 @@ function generateRandomKey(length = 20) {
     return `key-${result}`;
 }
 
-// API tạo key mới với user_id
+// API tạo key mới (không cần user_id)
 app.post('/get-key', (req, res) => {
     try {
-        const userIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-        const { user_id, username } = req.body;
-        
-        if (!user_id) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Thiếu user_id' 
-            });
-        }
-        
         const newKey = generateRandomKey(20);
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
         
-        // Kiểm tra xem user_id đã có key chưa hết hạn chưa
-        db.get(
-            'SELECT * FROM keys WHERE user_id = ? AND expires_at > datetime("now") AND used = FALSE',
-            [user_id],
-            (err, row) => {
+        // Tạo key mới
+        db.run(
+            'INSERT INTO keys (key, expires_at) VALUES (?, ?)',
+            [newKey, expiresAt.toISOString()],
+            function(err) {
                 if (err) {
-                    console.error('Database error:', err);
+                    console.error('Insert error:', err);
                     return res.status(500).json({ 
                         success: false, 
-                        message: 'Lỗi database' 
+                        message: 'Lỗi khi tạo key' 
                     });
                 }
                 
-                if (row) {
-                    return res.json({ 
-                        success: true, 
-                        key: row.key, 
-                        expires: row.expires_at,
-                        message: 'Bạn đã có key chưa sử dụng' 
-                    });
-                }
-                
-                // Tạo key mới
-                db.run(
-                    'INSERT INTO keys (key, user_id, username, ip, expires_at) VALUES (?, ?, ?, ?, ?)',
-                    [newKey, user_id, username || 'Unknown', userIp, expiresAt.toISOString()],
-                    function(err) {
-                        if (err) {
-                            console.error('Insert error:', err);
-                            return res.status(500).json({ 
-                                success: false, 
-                                message: 'Lỗi khi tạo key' 
-                            });
-                        }
-                        
-                        res.json({ 
-                            success: true, 
-                            key: newKey, 
-                            expires: expiresAt.toISOString(),
-                            message: 'Key đã được tạo thành công'
-                        });
-                    }
-                );
+                res.json({ 
+                    success: true, 
+                    key: newKey, 
+                    expires: expiresAt.toISOString(),
+                    message: 'Key đã được tạo thành công'
+                });
             }
         );
     } catch (error) {
@@ -113,15 +74,15 @@ app.post('/get-key', (req, res) => {
     }
 });
 
-// API xác thực key với user_id
+// API xác thực key (lưu user_id khi verify)
 app.post('/verify-key', (req, res) => {
     try {
-        const { key, user_id, username } = req.body;
+        const { key, user_id } = req.body;
         
-        if (!key || !user_id) {
+        if (!key) {
             return res.json({ 
                 valid: false, 
-                reason: 'Thiếu key hoặc user_id' 
+                reason: 'Thiếu key' 
             });
         }
         
@@ -155,24 +116,26 @@ app.post('/verify-key', (req, res) => {
                 }
                 
                 if (row.used) {
+                    // Kiểm tra nếu key đã được sử dụng bởi user khác
+                    if (row.user_id !== user_id) {
+                        return res.json({ 
+                            valid: false, 
+                            reason: 'Key đã được sử dụng bởi user khác' 
+                        });
+                    }
+                    // Nếu là cùng user thì vẫn hợp lệ
                     return res.json({ 
-                        valid: false, 
-                        reason: 'Key đã được sử dụng' 
+                        valid: true,
+                        user_id: row.user_id,
+                        created_at: row.created_at,
+                        expires_at: row.expires_at
                     });
                 }
                 
-                if (row.user_id && row.user_id !== user_id) {
-                    return res.json({ 
-                        valid: false, 
-                        reason: 'Key không thuộc về user này' 
-                    });
-                }
-                
-                // Đánh dấu key đã sử dụng
-                const usedAt = new Date().toISOString();
+                // Lưu user_id và đánh dấu đã sử dụng
                 db.run(
-                    'UPDATE keys SET used = TRUE, used_at = ?, used_by = ? WHERE key = ?',
-                    [usedAt, username || 'Unknown', key],
+                    'UPDATE keys SET used = TRUE, user_id = ? WHERE key = ?',
+                    [user_id, key],
                     function(err) {
                         if (err) {
                             console.error('Lỗi khi cập nhật key:', err);
@@ -182,7 +145,7 @@ app.post('/verify-key', (req, res) => {
                 
                 res.json({ 
                     valid: true,
-                    user_id: row.user_id,
+                    user_id: user_id,
                     created_at: row.created_at,
                     expires_at: row.expires_at
                 });
@@ -197,13 +160,13 @@ app.post('/verify-key', (req, res) => {
     }
 });
 
-// API lấy thông tin key theo user_id
-app.get('/key-info/:user_id', (req, res) => {
-    const { user_id } = req.params;
+// API kiểm tra key info
+app.get('/key-info/:key', (req, res) => {
+    const { key } = req.params;
     
     db.get(
-        'SELECT * FROM keys WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-        [user_id],
+        'SELECT * FROM keys WHERE key = ?',
+        [key],
         (err, row) => {
             if (err) {
                 return res.status(500).json({ 
@@ -214,7 +177,7 @@ app.get('/key-info/:user_id', (req, res) => {
             if (!row) {
                 return res.json({ 
                     exists: false,
-                    message: 'Không tìm thấy key cho user này'
+                    message: 'Key không tồn tại'
                 });
             }
             
@@ -222,12 +185,10 @@ app.get('/key-info/:user_id', (req, res) => {
                 exists: true,
                 key: row.key,
                 user_id: row.user_id,
-                username: row.username,
                 created_at: row.created_at,
                 expires_at: row.expires_at,
                 used: row.used === 1,
-                used_at: row.used_at,
-                used_by: row.used_by
+                is_expired: new Date() > new Date(row.expires_at)
             });
         }
     );
@@ -251,31 +212,8 @@ app.get('/', (req, res) => {
             health: '/health',
             getKey: 'POST /get-key',
             verifyKey: 'POST /verify-key',
-            keyInfo: 'GET /key-info/:user_id'
-        },
-        documentation: 'Sử dụng POST /get-key với {user_id, username} để tạo key'
-    });
-});
-
-// Xử lý lỗi 404
-app.use('*', (req, res) => {
-    res.status(404).json({ 
-        error: 'Endpoint không tồn tại',
-        available_endpoints: {
-            health: 'GET /health',
-            getKey: 'POST /get-key',
-            verifyKey: 'POST /verify-key',
-            keyInfo: 'GET /key-info/:user_id'
+            keyInfo: 'GET /key-info/:key'
         }
-    });
-});
-
-// Xử lý lỗi global
-app.use((error, req, res, next) => {
-    console.error('Global error handler:', error);
-    res.status(500).json({ 
-        error: 'Lỗi server nội bộ',
-        message: error.message 
     });
 });
 
@@ -283,5 +221,4 @@ app.use((error, req, res, next) => {
 app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
     console.log(`📊 Health check: https://qqwq-2.onrender.com/health`);
-    console.log(`🌐 Server URL: https://qqwq-2.onrender.com/`);
 });
