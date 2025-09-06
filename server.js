@@ -14,7 +14,7 @@ const db = new sqlite3.Database('./keys.db', (err) => {
     if (err) {
         console.error('Lỗi kết nối database:', err);
     } else {
-        console.log('Kết nối SQLite trong memory thành công');
+        console.log('Kết nối SQLite thành công');
     }
 });
 
@@ -22,13 +22,21 @@ const db = new sqlite3.Database('./keys.db', (err) => {
 db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT UNIQUE NOT NULL,
-    user_id TEXT,
+    user_ip TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME NOT NULL,
     used BOOLEAN DEFAULT FALSE
 )`);
 
-// Hàm tạo key ngẫu nhiên 20 ký tự
+// Tạo bảng requests để theo dõi thời gian request
+db.run(`CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_ip TEXT NOT NULL,
+    last_request_time DATETIME NOT NULL,
+    request_count INTEGER DEFAULT 1
+)`);
+
+// Hàm tạo key ngẫu nhiên
 function generateRandomKey(length = 5) {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let result = '';
@@ -38,31 +46,98 @@ function generateRandomKey(length = 5) {
     return `key-${result}`;
 }
 
-// API tạo key mới (không cần user_id)
+// Hàm lấy địa chỉ IP của user
+function getUserIP(req) {
+    return req.headers['x-forwarded-for'] || 
+           req.connection.remoteAddress || 
+           req.socket.remoteAddress ||
+           (req.connection.socket ? req.connection.socket.remoteAddress : null);
+}
+
+// API tạo key mới với kiểm tra thời gian 24h
 app.post('/get-key', (req, res) => {
     try {
-        const newKey = generateRandomKey(5);
-        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
+        const userIP = getUserIP(req);
+        const now = new Date();
         
-        // Tạo key mới
-        db.run(
-            'INSERT INTO keys (key, expires_at) VALUES (?, ?)',
-            [newKey, expiresAt.toISOString()],
-            function(err) {
+        // Kiểm tra xem user đã request key trước đó chưa
+        db.get(
+            'SELECT * FROM requests WHERE user_ip = ?',
+            [userIP],
+            (err, row) => {
                 if (err) {
-                    console.error('Insert error:', err);
+                    console.error('Database error:', err);
                     return res.status(500).json({ 
                         success: false, 
-                        message: 'Lỗi khi tạo key' 
+                        message: 'Lỗi server' 
                     });
                 }
                 
-                res.json({ 
-                    success: true, 
-                    key: newKey, 
-                    expires: expiresAt.toISOString(),
-                    message: 'Key đã được tạo thành công'
-                });
+                if (row) {
+                    // Kiểm tra thời gian từ lần request cuối
+                    const lastRequestTime = new Date(row.last_request_time);
+                    const timeDiff = now - lastRequestTime;
+                    const hoursDiff = timeDiff / (1000 * 60 * 60);
+                    
+                    if (hoursDiff < 24) {
+                        const timeLeft = 24 - hoursDiff;
+                        const hoursLeft = Math.floor(timeLeft);
+                        const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
+                        
+                        return res.status(429).json({ 
+                            success: false, 
+                            message: `Bạn phải chờ ${hoursLeft} giờ ${minutesLeft} phút nữa để lấy key mới`,
+                            time_left: timeLeft
+                        });
+                    }
+                    
+                    // Cập nhật thời gian request
+                    db.run(
+                        'UPDATE requests SET last_request_time = ?, request_count = request_count + 1 WHERE user_ip = ?',
+                        [now.toISOString(), userIP],
+                        (err) => {
+                            if (err) {
+                                console.error('Update request error:', err);
+                            }
+                        }
+                    );
+                } else {
+                    // Thêm request mới
+                    db.run(
+                        'INSERT INTO requests (user_ip, last_request_time) VALUES (?, ?)',
+                        [userIP, now.toISOString()],
+                        (err) => {
+                            if (err) {
+                                console.error('Insert request error:', err);
+                            }
+                        }
+                    );
+                }
+                
+                // Tạo key mới
+                const newKey = generateRandomKey(5);
+                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
+                
+                db.run(
+                    'INSERT INTO keys (key, user_ip, expires_at) VALUES (?, ?, ?)',
+                    [newKey, userIP, expiresAt.toISOString()],
+                    function(err) {
+                        if (err) {
+                            console.error('Insert key error:', err);
+                            return res.status(500).json({ 
+                                success: false, 
+                                message: 'Lỗi khi tạo key' 
+                            });
+                        }
+                        
+                        res.json({ 
+                            success: true, 
+                            key: newKey, 
+                            expires: expiresAt.toISOString(),
+                            message: 'Key đã được tạo thành công'
+                        });
+                    }
+                );
             }
         );
     } catch (error) {
@@ -185,6 +260,7 @@ app.get('/key-info/:key', (req, res) => {
                 exists: true,
                 key: row.key,
                 user_id: row.user_id,
+                user_ip: row.user_ip,
                 created_at: row.created_at,
                 expires_at: row.expires_at,
                 used: row.used === 1,
@@ -194,13 +270,71 @@ app.get('/key-info/:key', (req, res) => {
     );
 });
 
+// API kiểm tra thời gian chờ còn lại
+app.get('/check-time-left', (req, res) => {
+    try {
+        const userIP = getUserIP(req);
+        
+        db.get(
+            'SELECT * FROM requests WHERE user_ip = ?',
+            [userIP],
+            (err, row) => {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ 
+                        success: false, 
+                        message: 'Lỗi server' 
+                    });
+                }
+                
+                if (!row) {
+                    return res.json({ 
+                        can_request: true,
+                        time_left: 0,
+                        message: 'Bạn có thể lấy key ngay bây giờ'
+                    });
+                }
+                
+                const lastRequestTime = new Date(row.last_request_time);
+                const now = new Date();
+                const timeDiff = now - lastRequestTime;
+                const hoursDiff = timeDiff / (1000 * 60 * 60);
+                
+                if (hoursDiff >= 24) {
+                    return res.json({ 
+                        can_request: true,
+                        time_left: 0,
+                        message: 'Bạn có thể lấy key ngay bây giờ'
+                    });
+                } else {
+                    const timeLeft = 24 - hoursDiff;
+                    const hoursLeft = Math.floor(timeLeft);
+                    const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
+                    
+                    return res.json({ 
+                        can_request: false,
+                        time_left: timeLeft,
+                        message: `Bạn phải chờ ${hoursLeft} giờ ${minutesLeft} phút nữa để lấy key mới`
+                    });
+                }
+            }
+        );
+    } catch (error) {
+        console.error('Error in /check-time-left:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Lỗi server nội bộ' 
+        });
+    }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
         service: 'Key System API',
-        url: 'https://qqwq-2.onrender.com/'
+        url: 'https://qqwq-8.onrender.com/'
     });
 });
 
@@ -212,7 +346,8 @@ app.get('/', (req, res) => {
             health: '/health',
             getKey: 'POST /get-key',
             verifyKey: 'POST /verify-key',
-            keyInfo: 'GET /key-info/:key'
+            keyInfo: 'GET /key-info/:key',
+            checkTimeLeft: 'GET /check-time-left'
         }
     });
 });
@@ -220,5 +355,5 @@ app.get('/', (req, res) => {
 // Khởi động server
 app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
-    console.log(`📊 Health check: https://qqwq-2.onrender.com/health`);
+    console.log(`📊 Health check: https://qqwq-8.onrender.com/health`);
 });
