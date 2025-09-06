@@ -80,8 +80,8 @@ app.post('/get-key', (req, res) => {
                     const timeDiff = now - lastRequestTime;
                     const hoursDiff = timeDiff / (1000 * 60 * 60);
                     
-                    if (hoursDiff < 24) {
-                        const timeLeft = 24 - hoursDiff;
+                    if (hoursDiff < 1) {
+                        const timeLeft = 1 - hoursDiff;
                         const hoursLeft = Math.floor(timeLeft);
                         const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
                         
