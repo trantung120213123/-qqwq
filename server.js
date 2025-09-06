@@ -22,7 +22,8 @@ const db = new sqlite3.Database('./keys.db', (err) => {
 db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT UNIQUE NOT NULL,
-    user_ip TEXT,
+    hwid TEXT,
+    user_id TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     expires_at DATETIME NOT NULL,
     used BOOLEAN DEFAULT FALSE
@@ -31,7 +32,7 @@ db.run(`CREATE TABLE IF NOT EXISTS keys (
 // Tạo bảng requests để theo dõi thời gian request
 db.run(`CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_ip TEXT NOT NULL,
+    hwid TEXT NOT NULL,
     last_request_time DATETIME NOT NULL,
     request_count INTEGER DEFAULT 1
 )`);
@@ -46,24 +47,24 @@ function generateRandomKey(length = 5) {
     return `key-${result}`;
 }
 
-// Hàm lấy địa chỉ IP của user
-function getUserIP(req) {
-    return req.headers['x-forwarded-for'] || 
-           req.connection.remoteAddress || 
-           req.socket.remoteAddress ||
-           (req.connection.socket ? req.connection.socket.remoteAddress : null);
-}
-
-// API tạo key mới với kiểm tra thời gian 24h
+// API tạo key mới với kiểm tra HWID và thời gian 24h
 app.post('/get-key', (req, res) => {
     try {
-        const userIP = getUserIP(req);
+        const { hwid } = req.body;
+        
+        if (!hwid) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Thiếu HWID' 
+            });
+        }
+        
         const now = new Date();
         
-        // Kiểm tra xem user đã request key trước đó chưa
+        // Kiểm tra xem HWID đã request key trước đó chưa
         db.get(
-            'SELECT * FROM requests WHERE user_ip = ?',
-            [userIP],
+            'SELECT * FROM requests WHERE hwid = ?',
+            [hwid],
             (err, row) => {
                 if (err) {
                     console.error('Database error:', err);
@@ -93,8 +94,8 @@ app.post('/get-key', (req, res) => {
                     
                     // Cập nhật thời gian request
                     db.run(
-                        'UPDATE requests SET last_request_time = ?, request_count = request_count + 1 WHERE user_ip = ?',
-                        [now.toISOString(), userIP],
+                        'UPDATE requests SET last_request_time = ?, request_count = request_count + 1 WHERE hwid = ?',
+                        [now.toISOString(), hwid],
                         (err) => {
                             if (err) {
                                 console.error('Update request error:', err);
@@ -104,8 +105,8 @@ app.post('/get-key', (req, res) => {
                 } else {
                     // Thêm request mới
                     db.run(
-                        'INSERT INTO requests (user_ip, last_request_time) VALUES (?, ?)',
-                        [userIP, now.toISOString()],
+                        'INSERT INTO requests (hwid, last_request_time) VALUES (?, ?)',
+                        [hwid, now.toISOString()],
                         (err) => {
                             if (err) {
                                 console.error('Insert request error:', err);
@@ -119,8 +120,8 @@ app.post('/get-key', (req, res) => {
                 const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
                 
                 db.run(
-                    'INSERT INTO keys (key, user_ip, expires_at) VALUES (?, ?, ?)',
-                    [newKey, userIP, expiresAt.toISOString()],
+                    'INSERT INTO keys (key, hwid, expires_at) VALUES (?, ?, ?)',
+                    [newKey, hwid, expiresAt.toISOString()],
                     function(err) {
                         if (err) {
                             console.error('Insert key error:', err);
@@ -158,6 +159,13 @@ app.post('/verify-key', (req, res) => {
             return res.json({ 
                 valid: false, 
                 reason: 'Thiếu key' 
+            });
+        }
+        
+        if (!user_id) {
+            return res.json({ 
+                valid: false, 
+                reason: 'Thiếu user_id' 
             });
         }
         
@@ -260,7 +268,7 @@ app.get('/key-info/:key', (req, res) => {
                 exists: true,
                 key: row.key,
                 user_id: row.user_id,
-                user_ip: row.user_ip,
+                hwid: row.hwid,
                 created_at: row.created_at,
                 expires_at: row.expires_at,
                 used: row.used === 1,
@@ -270,14 +278,21 @@ app.get('/key-info/:key', (req, res) => {
     );
 });
 
-// API kiểm tra thời gian chờ còn lại
-app.get('/check-time-left', (req, res) => {
+// API kiểm tra thời gian chờ còn lại theo HWID
+app.post('/check-time-left', (req, res) => {
     try {
-        const userIP = getUserIP(req);
+        const { hwid } = req.body;
+        
+        if (!hwid) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Thiếu HWID' 
+            });
+        }
         
         db.get(
-            'SELECT * FROM requests WHERE user_ip = ?',
-            [userIP],
+            'SELECT * FROM requests WHERE hwid = ?',
+            [hwid],
             (err, row) => {
                 if (err) {
                     console.error('Database error:', err);
@@ -300,14 +315,14 @@ app.get('/check-time-left', (req, res) => {
                 const timeDiff = now - lastRequestTime;
                 const hoursDiff = timeDiff / (1000 * 60 * 60);
                 
-                if (hoursDiff >= 24) {
+                if (hoursDiff >= 1) {
                     return res.json({ 
                         can_request: true,
                         time_left: 0,
                         message: 'Bạn có thể lấy key ngay bây giờ'
                     });
                 } else {
-                    const timeLeft = 24 - hoursDiff;
+                    const timeLeft = 1 - hoursDiff;
                     const hoursLeft = Math.floor(timeLeft);
                     const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
                     
@@ -333,8 +348,7 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
-        service: 'Key System API',
-        url: 'https://qqwq-8.onrender.com/'
+        service: 'Key System API'
     });
 });
 
@@ -347,7 +361,7 @@ app.get('/', (req, res) => {
             getKey: 'POST /get-key',
             verifyKey: 'POST /verify-key',
             keyInfo: 'GET /key-info/:key',
-            checkTimeLeft: 'GET /check-time-left'
+            checkTimeLeft: 'POST /check-time-left'
         }
     });
 });
@@ -355,5 +369,4 @@ app.get('/', (req, res) => {
 // Khởi động server
 app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
-    console.log(`📊 Health check: https://qqwq-8.onrender.com/health`);
 });
