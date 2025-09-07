@@ -13,7 +13,7 @@ const KEY_TTL_SECONDS = process.env.KEY_TTL_SECONDS || 86400;
 const REQUEST_COOLDOWN_SECONDS = process.env.REQUEST_COOLDOWN_SECONDS || 3600;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'supersecret_admin_token_change_me';
 const MAX_REQUESTS_PER_IP_PER_MIN = process.env.RATE_LIMIT || 10;
-const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/ee-zvxi9';
+const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/key-2tfgu';
 
 // Middleware
 app.use(cors());
