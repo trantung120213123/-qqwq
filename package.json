@@ -12,8 +12,6 @@
     "sqlite3": "^5.1.6",
     "cookie-parser": "^1.4.6",
     "bcrypt": "^5.1.0"
-}
-
   },
   "keywords": [
     "key-system",
