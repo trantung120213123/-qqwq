@@ -7,13 +7,14 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Biến môi trường (có thể đặt trong file .env)
-const TOKEN_TTL_SECONDS = process.env.TOKEN_TTL_SECONDS || 300; // 5 phút
-const KEY_TTL_SECONDS = process.env.KEY_TTL_SECONDS || 86400; // 24 giờ
-const HWID_COOLDOWN_SECONDS = process.env.HWID_COOLDOWN_SECONDS || 3600; // 1 giờ
+// Biến môi trường
+const TOKEN_TTL_SECONDS = process.env.TOKEN_TTL_SECONDS || 300;
+const KEY_TTL_SECONDS = process.env.KEY_TTL_SECONDS || 86400;
+const HWID_COOLDOWN_SECONDS = process.env.HWID_COOLDOWN_SECONDS || 3600;
 const HWID_HMAC_SECRET = process.env.HWID_HMAC_SECRET || 'some_long_random_secret_change_in_production';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'supersecret_admin_token_change_me';
 const MAX_REQUESTS_PER_IP_PER_MIN = process.env.RATE_LIMIT || 10;
+const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/ee-zvxi9';
 
 // Middleware
 app.use(cors());
@@ -21,7 +22,7 @@ app.use(express.json());
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 phút
+  windowMs: 60 * 1000,
   max: MAX_REQUESTS_PER_IP_PER_MIN,
   message: { error: 'Quá nhiều yêu cầu, vui lòng thử lại sau' },
   standardHeaders: true,
@@ -35,13 +36,12 @@ const db = new sqlite3.Database('./keys.db', (err) => {
     console.error('Lỗi kết nối database:', err);
   } else {
     console.log('Kết nối SQLite thành công');
-    db.run('PRAGMA foreign_keys = ON'); // Bật foreign key constraints
+    db.run('PRAGMA foreign_keys = ON');
   }
 });
 
 // Tạo các bảng cần thiết
 db.serialize(() => {
-  // Bảng tokens
   db.run(`CREATE TABLE IF NOT EXISTS tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token TEXT NOT NULL UNIQUE,
@@ -53,13 +53,13 @@ db.serialize(() => {
     used_at INTEGER
   )`);
 
-  // Bảng keys
   db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_value TEXT NOT NULL UNIQUE,
     hwid_hash TEXT,
     ip_address TEXT,
     token_id INTEGER,
+    user_id TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     active INTEGER DEFAULT 1,
@@ -67,7 +67,6 @@ db.serialize(() => {
     FOREIGN KEY(token_id) REFERENCES tokens(id)
   )`);
 
-  // Bảng requests
   db.run(`CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     hwid_hash TEXT NOT NULL UNIQUE,
@@ -76,7 +75,6 @@ db.serialize(() => {
     ip_address TEXT
   )`);
 
-  // Bảng bans
   db.run(`CREATE TABLE IF NOT EXISTS bans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     hwid_hash TEXT,
@@ -85,7 +83,6 @@ db.serialize(() => {
     created_at INTEGER NOT NULL
   )`);
 
-  // Tạo indexes
   db.run('CREATE INDEX IF NOT EXISTS idx_tokens_token ON tokens(token)');
   db.run('CREATE INDEX IF NOT EXISTS idx_keys_keyvalue ON keys(key_value)');
   db.run('CREATE INDEX IF NOT EXISTS idx_requests_hwid ON requests(hwid_hash)');
@@ -101,7 +98,13 @@ function generateToken() {
 }
 
 function generateKey() {
-  return crypto.randomBytes(16).toString('hex').toUpperCase();
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  for (let i = 0; i < 12; i++) {
+    if (i > 0 && i % 4 === 0) result += '-';
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
 function isBanned(hwidHash, ip, callback) {
@@ -194,11 +197,13 @@ app.post('/request-token', (req, res) => {
                 return res.status(500).json({ error: 'Lỗi khi tạo token' });
               }
               
-              const link = `${req.protocol}://${req.get('host')}/go/${token}`;
+              const finalUrl = `${req.protocol}://${req.get('host')}/final-getkey?token=${token}`;
+              const linkvertiseUrl = `${LINKVERITSE_URL}?to=${encodeURIComponent(finalUrl)}`;
+              
               res.json({ 
                 success: true, 
                 token, 
-                link, 
+                link: linkvertiseUrl, 
                 expires_at: expiresAt,
                 message: 'Token đã được tạo thành công'
               });
@@ -231,11 +236,11 @@ app.get('/go/:token', (req, res) => {
         return res.status(400).send('Token không hợp lệ hoặc đã hết hạn');
       }
       
-      // Ở đây bạn có thể redirect đến trang quảng cáo (Linkvertise, v.v.)
-      // Sau đó redirect về /final-getkey?token=xxx
+      const finalUrl = `${req.protocol}://${req.get('host')}/final-getkey?token=${token}`;
+      const linkvertiseUrl = `${LINKVERITSE_URL}?to=${encodeURIComponent(finalUrl)}`;
       
-      // Tạm thời redirect thẳng đến final-getkey (cho mục đích demo)
-      res.redirect(`/final-getkey?token=${token}`);
+      // Redirect đến Linkvertise
+      res.redirect(linkvertiseUrl);
     }
   );
 });
@@ -267,17 +272,93 @@ app.get('/final-getkey', (req, res) => {
         <!DOCTYPE html>
         <html>
         <head>
-          <title>Xác minh thành công</title>
+          <title>Xác minh thành công - Luex Key System</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-            .success { color: green; font-size: 24px; }
-            .loading { color: #666; margin-top: 20px; }
+            body {
+              font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+              background: linear-gradient(135deg, #2C2F33, #23272A);
+              color: #F5F5F5;
+              text-align: center;
+              padding: 50px;
+              margin: 0;
+            }
+            .container {
+              background: rgba(0, 0, 0, 0.5);
+              backdrop-filter: blur(12px);
+              border-radius: 20px;
+              padding: 30px;
+              max-width: 600px;
+              margin: 0 auto;
+              box-shadow: 0 15px 35px rgba(0, 0, 0, 0.3);
+            }
+            h1 {
+              background: linear-gradient(135deg, #5865F2, #8345F5);
+              -webkit-background-clip: text;
+              -webkit-text-fill-color: transparent;
+              font-size: 32px;
+              margin-bottom: 20px;
+            }
+            .success {
+              color: #57F287;
+              font-size: 24px;
+              margin: 20px 0;
+            }
+            .loading {
+              color: #FEE75C;
+              margin: 20px 0;
+              font-size: 18px;
+            }
+            .key-box {
+              background: rgba(255, 255, 255, 0.08);
+              padding: 15px;
+              border-radius: 12px;
+              margin: 20px 0;
+              border: 1px solid rgba(255, 255, 255, 0.1);
+              font-family: 'Courier New', monospace;
+              font-size: 18px;
+              word-break: break-all;
+            }
+            .btn {
+              background: linear-gradient(135deg, #5865F2, #8345F5);
+              color: white;
+              border: none;
+              padding: 14px 28px;
+              border-radius: 12px;
+              cursor: pointer;
+              font-size: 16px;
+              font-weight: 600;
+              margin: 10px;
+              transition: all 0.3s ease;
+            }
+            .btn:hover {
+              transform: translateY(-3px);
+              box-shadow: 0 8px 20px rgba(88, 101, 242, 0.4);
+            }
+            .error {
+              color: #ED4245;
+              margin: 20px 0;
+            }
           </style>
         </head>
         <body>
-          <div class="success">✓ Xác minh thành công!</div>
-          <div class="loading" id="status">Đang tạo key, vui lòng chờ...</div>
+          <div class="container">
+            <h1>Luex Key System</h1>
+            <div class="success">✓ Xác minh thành công!</div>
+            <div class="loading" id="status">Đang tạo key, vui lòng chờ...</div>
+            
+            <div id="keyContainer" style="display: none;">
+              <div class="key-box">
+                <span id="keyText"></span>
+              </div>
+              <button class="btn" id="copyKeyBtn"><i class="fas fa-copy"></i> Sao chép Key</button>
+              <div class="success" id="keyInfo"></div>
+            </div>
+            
+            <div class="error" id="errorMsg" style="display: none;"></div>
+          </div>
           
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
           <script>
             // Lấy HWID từ localStorage hoặc tạo mới
             function generateHWID() {
@@ -299,7 +380,8 @@ app.get('/final-getkey', (req, res) => {
               return 'hwid_' + Math.abs(hash).toString(16);
             }
             
-            const hwid = generateHWID();
+            const hwid = localStorage.getItem('hwid') || generateHWID();
+            localStorage.setItem('hwid', hwid);
             const token = '${token}';
             
             // Gọi API để lấy key
@@ -311,23 +393,36 @@ app.get('/final-getkey', (req, res) => {
             .then(response => response.json())
             .then(data => {
               if (data.success) {
-                document.getElementById('status').innerHTML = 
-                  'Key của bạn: <strong>' + data.key + '</strong><br>' +
-                  'Hết hạn: ' + new Date(data.expires_at * 1000).toLocaleString('vi-VN');
+                document.getElementById('status').style.display = 'none';
+                document.getElementById('keyContainer').style.display = 'block';
+                document.getElementById('keyText').textContent = data.key;
+                
+                const expiresDate = new Date(data.expires_at * 1000);
+                document.getElementById('keyInfo').innerHTML = 
+                  'Key hết hạn: ' + expiresDate.toLocaleString('vi-VN');
                 
                 // Tự động copy key vào clipboard
                 navigator.clipboard.writeText(data.key).then(() => {
-                  document.getElementById('status').innerHTML += 
-                    '<br><br>✓ Đã sao chép key vào clipboard!';
+                  document.getElementById('keyInfo').innerHTML += '<br>✓ Đã sao chép key vào clipboard!';
                 });
               } else {
-                document.getElementById('status').innerHTML = 
-                  'Lỗi: ' + (data.error || data.message);
+                document.getElementById('status').style.display = 'none';
+                document.getElementById('errorMsg').style.display = 'block';
+                document.getElementById('errorMsg').textContent = 'Lỗi: ' + (data.error || data.message);
               }
             })
             .catch(error => {
-              document.getElementById('status').innerHTML = 
-                'Lỗi kết nối: ' + error.message;
+              document.getElementById('status').style.display = 'none';
+              document.getElementById('errorMsg').style.display = 'block';
+              document.getElementById('errorMsg').textContent = 'Lỗi kết nối: ' + error.message;
+            });
+            
+            // Xử lý nút copy
+            document.getElementById('copyKeyBtn').addEventListener('click', function() {
+              const key = document.getElementById('keyText').textContent;
+              navigator.clipboard.writeText(key).then(() => {
+                document.getElementById('keyInfo').innerHTML += '<br>✓ Đã sao chép key vào clipboard!';
+              });
             });
           </script>
         </body>
@@ -432,59 +527,117 @@ app.post('/get-key', (req, res) => {
   }
 });
 
-// API xác thực key (giữ nguyên từ hệ thống cũ)
+// API xác thực key (lưu user_id khi verify)
 app.post('/verify-key', (req, res) => {
-  try {
-    const { key, hwid } = req.body;
-    
-    if (!key) {
-      return res.json({ valid: false, reason: 'Thiếu key' });
-    }
-    
-    if (!hwid) {
-      return res.json({ valid: false, reason: 'Thiếu HWID' });
-    }
-    
-    const hwidHash = hashHwid(hwid);
-    const now = Math.floor(Date.now() / 1000);
-    
-    db.get(
-      'SELECT * FROM keys WHERE key_value = ? AND active = 1',
-      [key],
-      (err, row) => {
-        if (err) {
-          console.error('Database error:', err);
-          return res.status(500).json({ valid: false, reason: 'Lỗi server' });
+    try {
+        const { key, hwid, user_id } = req.body;
+        
+        if (!key) {
+            return res.json({ 
+                valid: false, 
+                reason: 'Thiếu key' 
+            });
         }
         
-        if (!row) {
-          return res.json({ valid: false, reason: 'Key không tồn tại' });
+        if (!hwid) {
+            return res.json({ 
+                valid: false, 
+                reason: 'Thiếu HWID' 
+            });
+        }
+
+        if (!user_id) {
+            return res.json({
+                valid: false,
+                reason: 'Thiếu user_id'
+            });
         }
         
-        // Kiểm tra hết hạn
-        if (now > row.expires_at) {
-          return res.json({ valid: false, reason: 'Key đã hết hạn' });
-        }
+        const hwidHash = hashHwid(hwid);
+        const now = Math.floor(Date.now() / 1000);
         
-        // Kiểm tra HWID nếu key được bind với HWID
-        if (row.hwid_hash && row.hwid_hash !== hwidHash) {
-          return res.json({ valid: false, reason: 'Key không khớp với thiết bị' });
-        }
-        
-        res.json({ 
-          valid: true,
-          created_at: row.created_at,
-          expires_at: row.expires_at
+        db.get(
+            'SELECT * FROM keys WHERE key_value = ? AND active = 1',
+            [key],
+            (err, row) => {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ 
+                        valid: false, 
+                        reason: 'Lỗi server' 
+                    });
+                }
+                
+                if (!row) {
+                    return res.json({ 
+                        valid: false, 
+                        reason: 'Key không tồn tại' 
+                    });
+                }
+                
+                // Kiểm tra hết hạn
+                if (now > row.expires_at) {
+                    return res.json({ 
+                        valid: false, 
+                        reason: 'Key đã hết hạn' 
+                    });
+                }
+                
+                // Kiểm tra HWID nếu key được bind với HWID
+                if (row.hwid_hash && row.hwid_hash !== hwidHash) {
+                    return res.json({ 
+                        valid: false, 
+                        reason: 'Key không khớp với thiết bị' 
+                    });
+                }
+
+                // Kiểm tra đã sử dụng
+                if (row.used) {
+                    // Nếu user_id khác → key đã bị người khác dùng
+                    if (row.user_id !== user_id) {
+                        return res.json({
+                            valid: false,
+                            reason: 'Key đã được sử dụng bởi user khác'
+                        });
+                    }
+                    // Nếu cùng user → vẫn hợp lệ
+                    return res.json({
+                        valid: true,
+                        user_id: row.user_id,
+                        created_at: row.created_at,
+                        expires_at: row.expires_at
+                    });
+                }
+
+                // Nếu key chưa dùng → gán user_id và đánh dấu đã sử dụng
+                db.run(
+                    'UPDATE keys SET used = 1, user_id = ? WHERE key_value = ?',
+                    [user_id, key],
+                    function(err) {
+                        if (err) {
+                            console.error('Lỗi khi cập nhật key:', err);
+                        }
+                    }
+                );
+
+                res.json({ 
+                    valid: true,
+                    user_id: user_id,
+                    created_at: row.created_at,
+                    expires_at: row.expires_at
+                });
+            }
+        );
+    } catch (error) {
+        console.error('Error in /verify-key:', error);
+        res.status(500).json({ 
+            valid: false, 
+            reason: 'Lỗi server nội bộ' 
         });
-      }
-    );
-  } catch (error) {
-    console.error('Error in /verify-key:', error);
-    res.status(500).json({ valid: false, reason: 'Lỗi server nội bộ' });
-  }
+    }
 });
 
-// API kiểm tra thời gian chờ còn lại (giữ nguyên từ hệ thống cũ)
+// API kiểm tra thời gian chờ còn lại
 app.post('/check-time-left', (req, res) => {
   try {
     const { hwid } = req.body;
@@ -561,4 +714,5 @@ app.listen(PORT, () => {
   console.log(`   - Key TTL: ${KEY_TTL_SECONDS} giây`);
   console.log(`   - HWID Cooldown: ${HWID_COOLDOWN_SECONDS} giây`);
   console.log(`   - Rate Limit: ${MAX_REQUESTS_PER_IP_PER_MIN} requests/phút`);
+  console.log(`   - Linkvertise URL: ${LINKVERITSE_URL}`);
 });
