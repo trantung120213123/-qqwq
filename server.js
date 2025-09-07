@@ -3,6 +3,7 @@ const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const bcrypt = require('bcrypt');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,16 +13,23 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Khởi tạo database
-const db = new sqlite3.Database('./keys.db', (err) => {
+// Đảm bảo thư mục data tồn tại
+const dataDir = './data';
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir);
+}
+
+// Khởi tạo database với đường dẫn cố định trong thư mục data
+const dbPath = path.join(dataDir, 'keys.db');
+const db = new sqlite3.Database(dbPath, (err) => {
     if (err) {
         console.error('Lỗi kết nối database:', err);
     } else {
-        console.log('Kết nối SQLite thành công');
+        console.log('Kết nối SQLite thành công tại:', dbPath);
     }
 });
 
-// Tạo bảng keys
+// Tạo bảng keys với cấu trúc lưu trữ vĩnh viễn
 db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key TEXT UNIQUE NOT NULL,
@@ -29,9 +37,10 @@ db.run(`CREATE TABLE IF NOT EXISTS keys (
     user_id TEXT,
     username TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME NOT NULL,
+    expires_at DATETIME,
     used BOOLEAN DEFAULT FALSE,
-    banned BOOLEAN DEFAULT FALSE
+    banned BOOLEAN DEFAULT FALSE,
+    permanent BOOLEAN DEFAULT FALSE
 )`);
 
 // Tạo bảng requests để theo dõi thời gian request
@@ -42,14 +51,27 @@ db.run(`CREATE TABLE IF NOT EXISTS requests (
     request_count INTEGER DEFAULT 1
 )`);
 
-// Tạo bảng admin để lưu thông tin đăng nhập admin
+// Tạo bảng admin để lưu thông tin đăng nhập admin (vĩnh viễn)
 db.run(`CREATE TABLE IF NOT EXISTS admin (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL
+    password TEXT NOT NULL,
+    is_super_admin BOOLEAN DEFAULT FALSE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )`);
 
-// Thêm admin mặc định nếu chưa có
+// Tạo bảng users để lưu thông tin user vĩnh viễn
+db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT UNIQUE NOT NULL,
+    username TEXT NOT NULL,
+    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    total_keys_used INTEGER DEFAULT 0,
+    banned BOOLEAN DEFAULT FALSE
+)`);
+
+// Thêm super admin mặc định nếu chưa có
 const adminPassword = 'tungdeptrai1202';
 bcrypt.hash(adminPassword, 10, (err, hash) => {
     if (err) {
@@ -64,11 +86,12 @@ bcrypt.hash(adminPassword, 10, (err, hash) => {
         }
         
         if (!row) {
-            db.run('INSERT INTO admin (username, password) VALUES (?, ?)', ['admin', hash], (err) => {
+            db.run('INSERT INTO admin (username, password, is_super_admin) VALUES (?, ?, ?)', 
+                   ['admin', hash, true], (err) => {
                 if (err) {
                     console.error('Lỗi khi tạo admin mặc định:', err);
                 } else {
-                    console.log('Admin mặc định đã được tạo. Username: admin, Password: tungdeptrai1202');
+                    console.log('Super admin mặc định đã được tạo. Username: admin, Password: tungdeptrai1202');
                 }
             });
         }
@@ -76,13 +99,99 @@ bcrypt.hash(adminPassword, 10, (err, hash) => {
 });
 
 // Hàm tạo key ngẫu nhiên
-function generateRandomKey(length = 5) {
+function generateRandomKey(length = 5, prefix = 'key-') {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let result = '';
     for (let i = 0; i < length; i++) {
         result += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    return `key-${result}`;
+    return `${prefix}${result}`;
+}
+
+// Hàm cập nhật thông tin user
+function updateUserInfo(user_id, username) {
+    if (!user_id) return;
+    
+    // Kiểm tra xem user đã tồn tại chưa
+    db.get('SELECT * FROM users WHERE user_id = ?', [user_id], (err, row) => {
+        if (err) {
+            console.error('Lỗi khi kiểm tra user:', err);
+            return;
+        }
+        
+        if (row) {
+            // Cập nhật thông tin user
+            db.run(
+                'UPDATE users SET username = ?, last_seen = CURRENT_TIMESTAMP, total_keys_used = total_keys_used + 1 WHERE user_id = ?',
+                [username, user_id],
+                (err) => {
+                    if (err) {
+                        console.error('Lỗi khi cập nhật user:', err);
+                    }
+                }
+            );
+        } else {
+            // Thêm user mới
+            db.run(
+                'INSERT INTO users (user_id, username) VALUES (?, ?)',
+                [user_id, username],
+                (err) => {
+                    if (err) {
+                        console.error('Lỗi khi thêm user mới:', err);
+                    }
+                }
+            );
+        }
+    });
+}
+
+// Middleware xác thực admin
+function authenticateAdmin(req, res, next) {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Token không hợp lệ' });
+    }
+    
+    const token = authHeader.substring(7);
+    
+    // Kiểm tra token admin
+    if (token !== 'tungdeptrai1202') {
+        return res.status(403).json({ error: 'Không có quyền truy cập' });
+    }
+    
+    next();
+}
+
+// Middleware xác thực super admin
+function authenticateSuperAdmin(req, res, next) {
+    const authHeader = req.headers.authorization;
+    
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Token không hợp lệ' });
+    }
+    
+    const token = authHeader.substring(7);
+    
+    // Kiểm tra token admin
+    if (token !== 'tungdeptrai1202') {
+        return res.status(403).json({ error: 'Không có quyền truy cập' });
+    }
+    
+    // Kiểm tra quyền super admin
+    const { username } = req.body;
+    db.get('SELECT * FROM admin WHERE username = ? AND is_super_admin = TRUE', [username], (err, row) => {
+        if (err) {
+            console.error('Lỗi khi kiểm tra super admin:', err);
+            return res.status(500).json({ error: 'Lỗi server' });
+        }
+        
+        if (!row) {
+            return res.status(403).json({ error: 'Chỉ super admin mới có quyền này' });
+        }
+        
+        next();
+    });
 }
 
 // API tạo key mới với kiểm tra HWID và thời gian 24h
@@ -237,7 +346,7 @@ app.post('/verify-key', (req, res) => {
                 // Kiểm tra hết hạn
                 const now = new Date();
                 const expiresAt = new Date(row.expires_at);
-                if (now > expiresAt) {
+                if (now > expiresAt && !row.permanent) {
                     return res.json({ 
                         valid: false, 
                         reason: 'Key đã hết hạn' 
@@ -258,9 +367,13 @@ app.post('/verify-key', (req, res) => {
                         user_id: row.user_id,
                         username: row.username,
                         created_at: row.created_at,
-                        expires_at: row.expires_at
+                        expires_at: row.expires_at,
+                        permanent: row.permanent
                     });
                 }
+                
+                // Cập nhật thông tin user
+                updateUserInfo(user_id, username);
                 
                 // Lưu user_id, username và đánh dấu đã sử dụng
                 db.run(
@@ -278,7 +391,8 @@ app.post('/verify-key', (req, res) => {
                     user_id: user_id,
                     username: username,
                     created_at: row.created_at,
-                    expires_at: row.expires_at
+                    expires_at: row.expires_at,
+                    permanent: row.permanent
                 });
             }
         );
@@ -292,20 +406,7 @@ app.post('/verify-key', (req, res) => {
 });
 
 // API lấy danh sách tất cả keys (chỉ admin)
-app.get('/admin/keys', (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
+app.get('/admin/keys', authenticateAdmin, (req, res) => {
     db.all('SELECT * FROM keys ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
@@ -317,21 +418,20 @@ app.get('/admin/keys', (req, res) => {
 });
 
 // API lấy danh sách tất cả users (chỉ admin)
-app.get('/admin/users', (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    db.all('SELECT DISTINCT user_id, username, COUNT(*) as key_count, MAX(created_at) as last_used FROM keys WHERE user_id IS NOT NULL GROUP BY user_id ORDER BY last_used DESC', (err, rows) => {
+app.get('/admin/users', authenticateAdmin, (req, res) => {
+    db.all('SELECT * FROM users ORDER BY last_seen DESC', (err, rows) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Lỗi database' });
+        }
+        
+        res.json(rows);
+    });
+});
+
+// API lấy danh sách admin (chỉ super admin)
+app.get('/admin/admins', authenticateAdmin, (req, res) => {
+    db.all('SELECT id, username, is_super_admin, created_at FROM admin ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
             return res.status(500).json({ error: 'Lỗi database' });
@@ -342,166 +442,149 @@ app.get('/admin/users', (req, res) => {
 });
 
 // API ban user (chỉ admin)
-app.post('/admin/ban-user', (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
+app.post('/admin/ban-user', authenticateAdmin, (req, res) => {
     const { user_id } = req.body;
     
     if (!user_id) {
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
+    // Cập nhật cả bảng keys và users
     db.run('UPDATE keys SET banned = TRUE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
             return res.status(500).json({ error: 'Lỗi database' });
         }
         
-        res.json({ 
-            success: true, 
-            message: `Đã ban user ${user_id}`,
-            changes: this.changes
+        db.run('UPDATE users SET banned = TRUE WHERE user_id = ?', [user_id], function(err) {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Lỗi database' });
+            }
+            
+            res.json({ 
+                success: true, 
+                message: `Đã ban user ${user_id}`,
+                changes: this.changes
+            });
         });
     });
 });
 
 // API unban user (chỉ admin)
-app.post('/admin/unban-user', (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
+app.post('/admin/unban-user', authenticateAdmin, (req, res) => {
     const { user_id } = req.body;
     
     if (!user_id) {
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
+    // Cập nhật cả bảng keys và users
     db.run('UPDATE keys SET banned = FALSE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
             return res.status(500).json({ error: 'Lỗi database' });
         }
         
-        res.json({ 
-            success: true, 
-            message: `Đã unban user ${user_id}`,
-            changes: this.changes
+        db.run('UPDATE users SET banned = FALSE WHERE user_id = ?', [user_id], function(err) {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Lỗi database' });
+            }
+            
+            res.json({ 
+                success: true, 
+                message: `Đã unban user ${user_id}`,
+                changes: this.changes
+            });
         });
     });
 });
 
 // API chỉnh sửa thời gian key (chỉ admin)
-app.post('/admin/update-key-expiry', (req, res) => {
-    const authHeader = req.headers.authorization;
+app.post('/admin/update-key-expiry', authenticateAdmin, (req, res) => {
+    const { key, hours, permanent } = req.body;
     
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
+    if (!key) {
+        return res.status(400).json({ error: 'Thiếu key' });
     }
     
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    const { key, hours } = req.body;
-    
-    if (!key || !hours) {
-        return res.status(400).json({ error: 'Thiếu key hoặc hours' });
-    }
-    
-    const newExpiry = new Date(Date.now() + hours * 60 * 60 * 1000);
-    
-    db.run('UPDATE keys SET expires_at = ? WHERE key = ?', [newExpiry.toISOString(), key], function(err) {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
-        }
-        
-        if (this.changes === 0) {
-            return res.status(404).json({ error: 'Key không tồn tại' });
-        }
-        
-        res.json({ 
-            success: true, 
-            message: `Đã cập nhật thời gian key ${key} thành ${hours} giờ`,
-            new_expiry: newExpiry.toISOString()
+    if (permanent) {
+        // Đặt key thành vĩnh viễn
+        db.run('UPDATE keys SET permanent = TRUE, expires_at = NULL WHERE key = ?', [key], function(err) {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Lỗi database' });
+            }
+            
+            if (this.changes === 0) {
+                return res.status(404).json({ error: 'Key không tồn tại' });
+            }
+            
+            res.json({ 
+                success: true, 
+                message: `Đã đặt key ${key} thành vĩnh viễn`,
+                permanent: true
+            });
         });
-    });
+    } else if (hours) {
+        // Cập nhật thời gian key
+        const newExpiry = new Date(Date.now() + hours * 60 * 60 * 1000);
+        
+        db.run('UPDATE keys SET expires_at = ?, permanent = FALSE WHERE key = ?', [newExpiry.toISOString(), key], function(err) {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Lỗi database' });
+            }
+            
+            if (this.changes === 0) {
+                return res.status(404).json({ error: 'Key không tồn tại' });
+            }
+            
+            res.json({ 
+                success: true, 
+                message: `Đã cập nhật thời gian key ${key} thành ${hours} giờ`,
+                new_expiry: newExpiry.toISOString(),
+                permanent: false
+            });
+        });
+    } else {
+        return res.status(400).json({ error: 'Thiếu hours hoặc permanent' });
+    }
 });
 
 // API tạo key mới (chỉ admin)
-app.post('/admin/create-key', (req, res) => {
-    const authHeader = req.headers.authorization;
+app.post('/admin/create-key', authenticateAdmin, (req, res) => {
+    const { hours = 24, permanent = false, keyPrefix = 'key-' } = req.body;
     
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
+    const newKey = generateRandomKey(5, keyPrefix);
+    let expiresAt = null;
+    
+    if (!permanent) {
+        expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
     }
     
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    const { hours = 24 } = req.body;
-    
-    const newKey = generateRandomKey(5);
-    const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
-    
-    db.run('INSERT INTO keys (key, expires_at) VALUES (?, ?)', [newKey, expiresAt.toISOString()], function(err) {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi khi tạo key' });
+    db.run('INSERT INTO keys (key, expires_at, permanent) VALUES (?, ?, ?)', 
+        [newKey, expiresAt ? expiresAt.toISOString() : null, permanent], 
+        function(err) {
+            if (err) {
+                console.error('Database error:', err);
+                return res.status(500).json({ error: 'Lỗi khi tạo key' });
+            }
+            
+            res.json({ 
+                success: true, 
+                key: newKey, 
+                expires: expiresAt ? expiresAt.toISOString() : null,
+                permanent: permanent,
+                message: 'Key đã được tạo thành công'
+            });
         }
-        
-        res.json({ 
-            success: true, 
-            key: newKey, 
-            expires: expiresAt.toISOString(),
-            message: 'Key đã được tạo thành công'
-        });
-    });
+    );
 });
 
 // API xóa key (chỉ admin)
-app.delete('/admin/delete-key/:key', (req, res) => {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
+app.delete('/admin/delete-key/:key', authenticateAdmin, (req, res) => {
     const { key } = req.params;
     
     db.run('DELETE FROM keys WHERE key = ?', [key], function(err) {
@@ -517,6 +600,74 @@ app.delete('/admin/delete-key/:key', (req, res) => {
         res.json({ 
             success: true, 
             message: `Đã xóa key ${key}`
+        });
+    });
+});
+
+// API tạo admin mới (chỉ super admin)
+app.post('/admin/create-admin', authenticateSuperAdmin, (req, res) => {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Thiếu username hoặc password' });
+    }
+    
+    // Kiểm tra xem admin đã tồn tại chưa
+    db.get('SELECT * FROM admin WHERE username = ?', [username], (err, row) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Lỗi database' });
+        }
+        
+        if (row) {
+            return res.status(400).json({ error: 'Admin đã tồn tại' });
+        }
+        
+        // Hash password và tạo admin mới
+        bcrypt.hash(password, 10, (err, hash) => {
+            if (err) {
+                console.error('Lỗi khi hash password:', err);
+                return res.status(500).json({ error: 'Lỗi server' });
+            }
+            
+            db.run('INSERT INTO admin (username, password) VALUES (?, ?)', 
+                   [username, hash], function(err) {
+                if (err) {
+                    console.error('Database error:', err);
+                    return res.status(500).json({ error: 'Lỗi khi tạo admin' });
+                }
+                
+                res.json({ 
+                    success: true, 
+                    message: `Đã tạo admin ${username} thành công`
+                });
+            });
+        });
+    });
+});
+
+// API xóa admin (chỉ super admin)
+app.delete('/admin/delete-admin/:username', authenticateSuperAdmin, (req, res) => {
+    const { username } = req.params;
+    
+    // Không cho xóa super admin
+    if (username === 'admin') {
+        return res.status(400).json({ error: 'Không thể xóa super admin' });
+    }
+    
+    db.run('DELETE FROM admin WHERE username = ?', [username], function(err) {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Lỗi database' });
+        }
+        
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Admin không tồn tại' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: `Đã xóa admin ${username}`
         });
     });
 });
@@ -542,6 +693,10 @@ app.get('/key-info/:key', (req, res) => {
                 });
             }
             
+            const now = new Date();
+            const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
+            const isExpired = expiresAt ? now > expiresAt : false;
+            
             res.json({
                 exists: true,
                 key: row.key,
@@ -552,7 +707,8 @@ app.get('/key-info/:key', (req, res) => {
                 expires_at: row.expires_at,
                 used: row.used === 1,
                 banned: row.banned === 1,
-                is_expired: new Date() > new Date(row.expires_at)
+                permanent: row.permanent === 1,
+                is_expired: isExpired && !row.permanent
             });
         }
     );
@@ -582,38 +738,38 @@ app.post('/check-time-left', (req, res) => {
                     });
                 }
                 
-                if (!row) {
-                    return res.json({ 
-                        can_request: true,
-                        time_left: 0,
-                        message: 'Bạn có thể lấy key ngay bây giờ'
-                    });
-                }
-                
-                const lastRequestTime = new Date(row.last_request_time);
-                const now = new Date();
-                const timeDiff = now - lastRequestTime;
-                const hoursDiff = timeDiff / (1000 * 60 * 60);
-                
-                if (hoursDiff >= 1) {
-                    return res.json({ 
-                        can_request: true,
-                        time_left: 0,
-                        message: 'Bạn có thể lấy key ngay bây giờ'
-                    });
-                } else {
-                    const timeLeft = 1 - hoursDiff;
-                    const hoursLeft = Math.floor(timeLeft);
-                    const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
-                    
-                    return res.json({ 
-                        can_request: false,
-                        time_left: timeLeft,
-                        message: `Bạn phải chờ ${hoursLeft} giờ ${minutesLeft} phút nữa để lấy key mới`
-                    });
-                }
+        if (!row) {
+            return res.json({ 
+                can_request: true,
+                time_left: 0,
+                message: 'Bạn có thể lấy key ngay bây giờ'
+            });
+        }
+        
+        const lastRequestTime = new Date(row.last_request_time);
+        const now = new Date();
+        const timeDiff = now - lastRequestTime;
+        const hoursDiff = timeDiff / (1000 * 60 * 60);
+        
+        if (hoursDiff >= 1) {
+            return res.json({ 
+                can_request: true,
+                time_left: 0,
+                message: 'Bạn có thể lấy key ngay bây giờ'
+            });
+        } else {
+            const timeLeft = 1 - hoursDiff;
+            const hoursLeft = Math.floor(timeLeft);
+            const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
+            
+            return res.json({ 
+                can_request: false,
+                time_left: timeLeft,
+                message: `Bạn phải chờ ${hoursLeft} giờ ${minutesLeft} phút nữa để lấy key mới`
+            });
+        }
             }
-        );
+    );
     } catch (error) {
         console.error('Error in /check-time-left:', error);
         res.status(500).json({ 
@@ -628,7 +784,8 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
-        service: 'Key System API'
+        service: 'Key System API',
+        database_path: dbPath
     });
 });
 
@@ -660,6 +817,7 @@ app.post('/admin/login', (req, res) => {
                 res.json({ 
                     success: true, 
                     token: 'tungdeptrai1202',
+                    is_super_admin: row.is_super_admin,
                     message: 'Đăng nhập thành công'
                 });
             } else {
@@ -669,17 +827,38 @@ app.post('/admin/login', (req, res) => {
     });
 });
 
+// API backup database (chỉ admin)
+app.get('/admin/backup', authenticateAdmin, (req, res) => {
+    const backupPath = path.join(dataDir, `backup-${Date.now()}.db`);
+    
+    // Tạo bản sao của database
+    fs.copyFile(dbPath, backupPath, (err) => {
+        if (err) {
+            console.error('Lỗi khi tạo backup:', err);
+            return res.status(500).json({ error: 'Lỗi khi tạo backup' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Backup thành công',
+            backup_path: backupPath
+        });
+    });
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({ 
         message: 'Key System API đang hoạt động',
+        database: dbPath,
         endpoints: {
             health: '/health',
             getKey: 'POST /get-key',
             verifyKey: 'POST /verify-key',
             keyInfo: 'GET /key-info/:key',
             checkTimeLeft: 'POST /check-time-left',
-            adminLogin: 'POST /admin/login'
+            adminLogin: 'POST /admin/login',
+            adminBackup: 'GET /admin/backup'
         }
     });
 });
@@ -687,4 +866,5 @@ app.get('/', (req, res) => {
 // Khởi động server
 app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
+    console.log(`💾 Database được lưu tại: ${dbPath}`);
 });
