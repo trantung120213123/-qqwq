@@ -2,7 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit');
+const path = require('path');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,21 +14,44 @@ const KEY_TTL_SECONDS = process.env.KEY_TTL_SECONDS || 86400;
 const REQUEST_COOLDOWN_SECONDS = process.env.REQUEST_COOLDOWN_SECONDS || 3600;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'supersecret_admin_token_change_me';
 const MAX_REQUESTS_PER_IP_PER_MIN = process.env.RATE_LIMIT || 10;
-const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/key-2tfgu';
+const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/ee-zvxi9';
 
-// Middleware
+// Middleware - ĐẶT CÁC ROUTE QUAN TRỌNG TRƯỚC static
 app.use(cors());
 app.use(express.json());
+app.use(cookieParser());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: MAX_REQUESTS_PER_IP_PER_MIN,
-  message: { error: 'Quá nhiều yêu cầu, vui lòng thử lại sau' },
-  standardHeaders: true,
-  legacyHeaders: false,
+// Rate limiting (tự implement thay vì dùng package)
+const rateLimitMap = new Map();
+
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 60 * 1000; // 1 phút
+  
+  if (!rateLimitMap.has(ip)) {
+    rateLimitMap.set(ip, { count: 1, startTime: now });
+    return next();
+  }
+  
+  const ipData = rateLimitMap.get(ip);
+  
+  if (now - ipData.startTime > windowMs) {
+    // Reset counter nếu đã qua 1 phút
+    ipData.count = 1;
+    ipData.startTime = now;
+    return next();
+  }
+  
+  if (ipData.count >= MAX_REQUESTS_PER_IP_PER_MIN) {
+    return res.status(429).json({ 
+      error: 'Quá nhiều yêu cầu, vui lòng thử lại sau' 
+    });
+  }
+  
+  ipData.count++;
+  next();
 });
-app.use(limiter);
 
 // Khởi tạo database
 const db = new sqlite3.Database('./keys.db', (err) => {
@@ -202,7 +226,7 @@ app.post('/request-token', (req, res) => {
   }
 });
 
-// API redirect đến trang vượt link
+// API redirect đến trang vượt link - ĐẶT TRƯỚC static
 app.get('/go/:token', (req, res) => {
   const { token } = req.params;
   const now = Math.floor(Date.now() / 1000);
@@ -229,13 +253,29 @@ app.get('/go/:token', (req, res) => {
   );
 });
 
-// Trang sau khi vượt link thành công
+// Trang sau khi vượt link thành công - ĐẶT TRƯỚC static
 app.get('/final-getkey', (req, res) => {
   const { token } = req.query;
   const now = Math.floor(Date.now() / 1000);
   
   if (!token) {
-    return res.status(400).send('Thiếu token');
+    return res.status(400).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Lỗi - Luex Key System</title>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+          .error { color: #ff4444; font-size: 18px; }
+        </style>
+      </head>
+      <body>
+        <h1>Lỗi</h1>
+        <p class="error">Thiếu token. Vui lòng quay lại trang chủ.</p>
+        <a href="/">Quay lại trang chủ</a>
+      </body>
+      </html>
+    `);
   }
   
   db.get(
@@ -248,7 +288,23 @@ app.get('/final-getkey', (req, res) => {
       }
       
       if (!row) {
-        return res.status(400).send('Token không hợp lệ hoặc đã hết hạn');
+        return res.status(400).send(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Lỗi - Luex Key System</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+              .error { color: #ff4444; font-size: 18px; }
+            </style>
+          </head>
+          <body>
+            <h1>Lỗi</h1>
+            <p class="error">Token không hợp lệ hoặc đã hết hạn.</p>
+            <a href="/">Quay lại trang chủ</a>
+          </body>
+          </html>
+        `);
       }
       
       // Trả về trang HTML với script tự động gọi API /get-key
@@ -302,26 +358,42 @@ app.get('/final-getkey', (req, res) => {
               font-family: 'Courier New', monospace;
               font-size: 18px;
               word-break: break-all;
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+            }
+            .key-text {
+              font-family: 'Courier New', monospace;
+              font-size: 18px;
+              font-weight: bold;
             }
             .btn {
               background: linear-gradient(135deg, #5865F2, #8345F5);
               color: white;
               border: none;
-              padding: 14px 28px;
-              border-radius: 12px;
+              padding: 10px 20px;
+              border-radius: 8px;
               cursor: pointer;
-              font-size: 16px;
+              font-size: 14px;
               font-weight: 600;
-              margin: 10px;
+              margin: 5px;
               transition: all 0.3s ease;
             }
             .btn:hover {
-              transform: translateY(-3px);
-              box-shadow: 0 8px 20px rgba(88, 101, 242, 0.4);
+              transform: translateY(-2px);
+              box-shadow: 0 5px 15px rgba(88, 101, 242, 0.3);
+            }
+            .btn-success {
+              background: linear-gradient(135deg, #57F287, #2dc46a);
             }
             .error {
               color: #ED4245;
               margin: 20px 0;
+            }
+            .info {
+              color: #FEE75C;
+              margin: 10px 0;
+              font-size: 14px;
             }
           </style>
         </head>
@@ -333,10 +405,12 @@ app.get('/final-getkey', (req, res) => {
             
             <div id="keyContainer" style="display: none;">
               <div class="key-box">
-                <span id="keyText"></span>
+                <span id="keyText" class="key-text"></span>
+                <button class="btn btn-success" id="copyKeyBtn">
+                  <i class="fas fa-copy"></i> Sao chép
+                </button>
               </div>
-              <button class="btn" id="copyKeyBtn"><i class="fas fa-copy"></i> Sao chép Key</button>
-              <div class="success" id="keyInfo"></div>
+              <div class="info" id="keyInfo"></div>
             </div>
             
             <div class="error" id="errorMsg" style="display: none;"></div>
@@ -624,20 +698,32 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Root endpoint
+// Static files - ĐẶT SAU CÁC ROUTE QUAN TRỌNG
+app.use(express.static('public'));
+
+// Root endpoint - phải đặt sau static
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'Key System API với token đang hoạt động',
-    endpoints: {
-      health: '/health',
-      requestToken: 'POST /request-token',
-      getKey: 'POST /get-key',
-      verifyKey: 'POST /verify-key',
-      checkTimeLeft: 'POST /check-time-left',
-      goToken: 'GET /go/:token',
-      finalGetKey: 'GET /final-getkey?token=xxx'
-    }
-  });
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Fallback route cho các trang không tồn tại
+app.get('*', (req, res) => {
+  res.status(404).send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>404 - Không tìm thấy trang</title>
+      <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+      </style>
+    </head>
+    <body>
+      <h1>404 - Không tìm thấy trang</h1>
+      <p>Trang bạn đang tìm kiếm không tồn tại.</p>
+      <a href="/">Quay lại trang chủ</a>
+    </body>
+    </html>
+  `);
 });
 
 // Khởi động server
