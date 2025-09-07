@@ -163,7 +163,7 @@ function authenticateAdmin(req, res, next) {
     next();
 }
 
-// Middleware xác thực super admin
+// Middleware xác thực super admin (fix cứng)
 function authenticateSuperAdmin(req, res, next) {
     const authHeader = req.headers.authorization;
     
@@ -173,26 +173,14 @@ function authenticateSuperAdmin(req, res, next) {
     
     const token = authHeader.substring(7);
     
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
+    // 🚀 Chỉ cho phép super admin mặc định (admin / tungdeptrai1202)
+    if (token === 'tungdeptrai1202') {
+        next(); // cho phép đi tiếp
+    } else {
+        return res.status(403).json({ error: 'Chỉ super admin mới có quyền này' });
     }
-    
-    // Kiểm tra quyền super admin
-    const { username } = req.body;
-    db.get('SELECT * FROM admin WHERE username = ? AND is_super_admin = TRUE', [username], (err, row) => {
-        if (err) {
-            console.error('Lỗi khi kiểm tra super admin:', err);
-            return res.status(500).json({ error: 'Lỗi server' });
-        }
-        
-        if (!row) {
-            return res.status(403).json({ error: 'Chỉ super admin mới có quyền này' });
-        }
-        
-        next();
-    });
 }
+
 
 // API tạo key mới với kiểm tra HWID và thời gian 24h
 app.post('/get-key', (req, res) => {
