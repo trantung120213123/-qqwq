@@ -10,8 +10,7 @@ const PORT = process.env.PORT || 3000;
 // Biến môi trường
 const TOKEN_TTL_SECONDS = process.env.TOKEN_TTL_SECONDS || 300;
 const KEY_TTL_SECONDS = process.env.KEY_TTL_SECONDS || 86400;
-const HWID_COOLDOWN_SECONDS = process.env.HWID_COOLDOWN_SECONDS || 3600;
-const HWID_HMAC_SECRET = process.env.HWID_HMAC_SECRET || 'some_long_random_secret_change_in_production';
+const REQUEST_COOLDOWN_SECONDS = process.env.REQUEST_COOLDOWN_SECONDS || 3600;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'supersecret_admin_token_change_me';
 const MAX_REQUESTS_PER_IP_PER_MIN = process.env.RATE_LIMIT || 10;
 const LINKVERITSE_URL = process.env.LINKVERITSE_URL || 'https://rekonise.com/ee-zvxi9';
@@ -45,7 +44,6 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token TEXT NOT NULL UNIQUE,
-    hwid_hash TEXT NOT NULL,
     ip_address TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
@@ -56,7 +54,6 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     key_value TEXT NOT NULL UNIQUE,
-    hwid_hash TEXT,
     ip_address TEXT,
     token_id INTEGER,
     user_id TEXT,
@@ -69,15 +66,13 @@ db.serialize(() => {
 
   db.run(`CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hwid_hash TEXT NOT NULL UNIQUE,
+    ip_address TEXT NOT NULL UNIQUE,
     last_request_at INTEGER NOT NULL,
-    request_count INTEGER DEFAULT 1,
-    ip_address TEXT
+    request_count INTEGER DEFAULT 1
   )`);
 
   db.run(`CREATE TABLE IF NOT EXISTS bans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hwid_hash TEXT,
     ip_address TEXT,
     reason TEXT,
     created_at INTEGER NOT NULL
@@ -85,14 +80,10 @@ db.serialize(() => {
 
   db.run('CREATE INDEX IF NOT EXISTS idx_tokens_token ON tokens(token)');
   db.run('CREATE INDEX IF NOT EXISTS idx_keys_keyvalue ON keys(key_value)');
-  db.run('CREATE INDEX IF NOT EXISTS idx_requests_hwid ON requests(hwid_hash)');
+  db.run('CREATE INDEX IF NOT EXISTS idx_requests_ip ON requests(ip_address)');
 });
 
 // Helper functions
-function hashHwid(hwid) {
-  return crypto.createHmac('sha256', HWID_HMAC_SECRET).update(hwid).digest('hex');
-}
-
 function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
@@ -107,10 +98,10 @@ function generateKey() {
   return result;
 }
 
-function isBanned(hwidHash, ip, callback) {
+function isBanned(ip, callback) {
   db.get(
-    'SELECT * FROM bans WHERE hwid_hash = ? OR ip_address = ?',
-    [hwidHash, ip],
+    'SELECT * FROM bans WHERE ip_address = ?',
+    [ip],
     (err, row) => {
       if (err) {
         console.error('Database error in isBanned:', err);
@@ -124,18 +115,11 @@ function isBanned(hwidHash, ip, callback) {
 // API request token
 app.post('/request-token', (req, res) => {
   try {
-    const { hwid } = req.body;
     const ip = req.ip || req.connection.remoteAddress;
-    
-    if (!hwid) {
-      return res.status(400).json({ error: 'Thiếu HWID' });
-    }
-    
-    const hwidHash = hashHwid(hwid);
     const now = Math.floor(Date.now() / 1000);
     
-    // Kiểm tra xem HWID hoặc IP có bị ban không
-    isBanned(hwidHash, ip, (err, banned) => {
+    // Kiểm tra xem IP có bị ban không
+    isBanned(ip, (err, banned) => {
       if (err) {
         return res.status(500).json({ error: 'Lỗi server' });
       }
@@ -146,8 +130,8 @@ app.post('/request-token', (req, res) => {
       
       // Kiểm tra cooldown
       db.get(
-        'SELECT * FROM requests WHERE hwid_hash = ?',
-        [hwidHash],
+        'SELECT * FROM requests WHERE ip_address = ?',
+        [ip],
         (err, row) => {
           if (err) {
             console.error('Database error:', err);
@@ -156,8 +140,8 @@ app.post('/request-token', (req, res) => {
           
           if (row) {
             const timeDiff = now - row.last_request_at;
-            if (timeDiff < HWID_COOLDOWN_SECONDS) {
-              const timeLeft = HWID_COOLDOWN_SECONDS - timeDiff;
+            if (timeDiff < REQUEST_COOLDOWN_SECONDS) {
+              const timeLeft = REQUEST_COOLDOWN_SECONDS - timeDiff;
               return res.status(429).json({ 
                 error: 'Vui lòng chờ', 
                 time_left_seconds: timeLeft,
@@ -167,8 +151,8 @@ app.post('/request-token', (req, res) => {
             
             // Cập nhật thời gian request
             db.run(
-              'UPDATE requests SET last_request_at = ?, request_count = request_count + 1, ip_address = ? WHERE hwid_hash = ?',
-              [now, ip, hwidHash],
+              'UPDATE requests SET last_request_at = ?, request_count = request_count + 1 WHERE ip_address = ?',
+              [now, ip],
               (err) => {
                 if (err) console.error('Update request error:', err);
               }
@@ -176,8 +160,8 @@ app.post('/request-token', (req, res) => {
           } else {
             // Thêm request mới
             db.run(
-              'INSERT INTO requests (hwid_hash, last_request_at, ip_address) VALUES (?, ?, ?)',
-              [hwidHash, now, ip],
+              'INSERT INTO requests (ip_address, last_request_at) VALUES (?, ?)',
+              [ip, now],
               (err) => {
                 if (err) console.error('Insert request error:', err);
               }
@@ -189,8 +173,8 @@ app.post('/request-token', (req, res) => {
           const expiresAt = now + TOKEN_TTL_SECONDS;
           
           db.run(
-            'INSERT INTO tokens (token, hwid_hash, ip_address, created_at, expires_at) VALUES (?, ?, ?, ?, ?)',
-            [token, hwidHash, ip, now, expiresAt],
+            'INSERT INTO tokens (token, ip_address, created_at, expires_at) VALUES (?, ?, ?, ?)',
+            [token, ip, now, expiresAt],
             function(err) {
               if (err) {
                 console.error('Insert token error:', err);
@@ -360,35 +344,13 @@ app.get('/final-getkey', (req, res) => {
           
           <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
           <script>
-            // Lấy HWID từ localStorage hoặc tạo mới
-            function generateHWID() {
-              const components = [
-                navigator.userAgent,
-                navigator.platform,
-                navigator.hardwareConcurrency,
-                screen.width + 'x' + screen.height,
-                navigator.language,
-                new Date().getTimezoneOffset()
-              ];
-              let hwid = components.join('|');
-              let hash = 0;
-              for (let i = 0; i < hwid.length; i++) {
-                const char = hwid.charCodeAt(i);
-                hash = ((hash << 5) - hash) + char;
-                hash = hash & hash;
-              }
-              return 'hwid_' + Math.abs(hash).toString(16);
-            }
-            
-            const hwid = localStorage.getItem('hwid') || generateHWID();
-            localStorage.setItem('hwid', hwid);
             const token = '${token}';
             
             // Gọi API để lấy key
             fetch('/get-key', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ token, hwid })
+              body: JSON.stringify({ token })
             })
             .then(response => response.json())
             .then(data => {
@@ -435,18 +397,17 @@ app.get('/final-getkey', (req, res) => {
 // API lấy key sau khi vượt link
 app.post('/get-key', (req, res) => {
   try {
-    const { token, hwid } = req.body;
+    const { token } = req.body;
     const ip = req.ip || req.connection.remoteAddress;
     
-    if (!token || !hwid) {
-      return res.status(400).json({ error: 'Thiếu token hoặc HWID' });
+    if (!token) {
+      return res.status(400).json({ error: 'Thiếu token' });
     }
     
-    const hwidHash = hashHwid(hwid);
     const now = Math.floor(Date.now() / 1000);
     
-    // Kiểm tra xem HWID hoặc IP có bị ban không
-    isBanned(hwidHash, ip, (err, banned) => {
+    // Kiểm tra xem IP có bị ban không
+    isBanned(ip, (err, banned) => {
       if (err) {
         return res.status(500).json({ error: 'Lỗi server' });
       }
@@ -474,20 +435,14 @@ app.post('/get-key', (req, res) => {
               return res.status(403).json({ error: 'Token không hợp lệ hoặc đã được sử dụng' });
             }
             
-            // Kiểm tra HWID có khớp không
-            if (tokenRow.hwid_hash !== hwidHash) {
-              db.run('ROLLBACK');
-              return res.status(403).json({ error: 'HWID không khớp với token' });
-            }
-            
             // Tạo key mới
             const keyValue = generateKey();
             const expiresAt = now + KEY_TTL_SECONDS;
             
             // Lưu key vào database
             db.run(
-              'INSERT INTO keys (key_value, hwid_hash, ip_address, token_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
-              [keyValue, hwidHash, ip, tokenRow.id, now, expiresAt],
+              'INSERT INTO keys (key_value, ip_address, token_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)',
+              [keyValue, ip, tokenRow.id, now, expiresAt],
               function(err) {
                 if (err) {
                   db.run('ROLLBACK');
@@ -530,19 +485,13 @@ app.post('/get-key', (req, res) => {
 // API xác thực key (lưu user_id khi verify)
 app.post('/verify-key', (req, res) => {
     try {
-        const { key, hwid, user_id } = req.body;
-        
+        const { key, user_id } = req.body;
+
+        // --- Kiểm tra dữ liệu bắt buộc ---
         if (!key) {
-            return res.json({ 
-                valid: false, 
-                reason: 'Thiếu key' 
-            });
-        }
-        
-        if (!hwid) {
-            return res.json({ 
-                valid: false, 
-                reason: 'Thiếu HWID' 
+            return res.json({
+                valid: false,
+                reason: 'Thiếu key'
             });
         }
 
@@ -552,46 +501,37 @@ app.post('/verify-key', (req, res) => {
                 reason: 'Thiếu user_id'
             });
         }
-        
-        const hwidHash = hashHwid(hwid);
-        const now = Math.floor(Date.now() / 1000);
-        
+
+        // --- Lấy key trong DB ---
         db.get(
             'SELECT * FROM keys WHERE key_value = ? AND active = 1',
             [key],
             (err, row) => {
                 if (err) {
                     console.error('Database error:', err);
-                    return res.status(500).json({ 
-                        valid: false, 
-                        reason: 'Lỗi server' 
-                    });
-                }
-                
-                if (!row) {
-                    return res.json({ 
-                        valid: false, 
-                        reason: 'Key không tồn tại' 
-                    });
-                }
-                
-                // Kiểm tra hết hạn
-                if (now > row.expires_at) {
-                    return res.json({ 
-                        valid: false, 
-                        reason: 'Key đã hết hạn' 
-                    });
-                }
-                
-                // Kiểm tra HWID nếu key được bind với HWID
-                if (row.hwid_hash && row.hwid_hash !== hwidHash) {
-                    return res.json({ 
-                        valid: false, 
-                        reason: 'Key không khớp với thiết bị' 
+                    return res.status(500).json({
+                        valid: false,
+                        reason: 'Lỗi server'
                     });
                 }
 
-                // Kiểm tra đã sử dụng
+                if (!row) {
+                    return res.json({
+                        valid: false,
+                        reason: 'Key không tồn tại'
+                    });
+                }
+
+                // --- Kiểm tra hết hạn ---
+                const now = Math.floor(Date.now() / 1000);
+                if (now > row.expires_at) {
+                    return res.json({
+                        valid: false,
+                        reason: 'Key đã hết hạn'
+                    });
+                }
+
+                // --- Kiểm tra đã sử dụng ---
                 if (row.used) {
                     // Nếu user_id khác → key đã bị người khác dùng
                     if (row.user_id !== user_id) {
@@ -609,18 +549,18 @@ app.post('/verify-key', (req, res) => {
                     });
                 }
 
-                // Nếu key chưa dùng → gán user_id và đánh dấu đã sử dụng
+                // --- Nếu key chưa dùng → gán user_id và đánh dấu đã sử dụng ---
                 db.run(
                     'UPDATE keys SET used = 1, user_id = ? WHERE key_value = ?',
                     [user_id, key],
-                    function(err) {
+                    function (err) {
                         if (err) {
                             console.error('Lỗi khi cập nhật key:', err);
                         }
                     }
                 );
 
-                res.json({ 
+                return res.json({
                     valid: true,
                     user_id: user_id,
                     created_at: row.created_at,
@@ -630,9 +570,9 @@ app.post('/verify-key', (req, res) => {
         );
     } catch (error) {
         console.error('Error in /verify-key:', error);
-        res.status(500).json({ 
-            valid: false, 
-            reason: 'Lỗi server nội bộ' 
+        res.status(500).json({
+            valid: false,
+            reason: 'Lỗi server nội bộ'
         });
     }
 });
@@ -640,18 +580,12 @@ app.post('/verify-key', (req, res) => {
 // API kiểm tra thời gian chờ còn lại
 app.post('/check-time-left', (req, res) => {
   try {
-    const { hwid } = req.body;
-    
-    if (!hwid) {
-      return res.status(400).json({ error: 'Thiếu HWID' });
-    }
-    
-    const hwidHash = hashHwid(hwid);
+    const ip = req.ip || req.connection.remoteAddress;
     const now = Math.floor(Date.now() / 1000);
     
     db.get(
-      'SELECT * FROM requests WHERE hwid_hash = ?',
-      [hwidHash],
+      'SELECT * FROM requests WHERE ip_address = ?',
+      [ip],
       (err, row) => {
         if (err) {
           console.error('Database error:', err);
@@ -663,10 +597,10 @@ app.post('/check-time-left', (req, res) => {
         }
         
         const timeDiff = now - row.last_request_at;
-        if (timeDiff >= HWID_COOLDOWN_SECONDS) {
+        if (timeDiff >= REQUEST_COOLDOWN_SECONDS) {
           return res.json({ can_request: true, time_left_seconds: 0 });
         } else {
-          const timeLeft = HWID_COOLDOWN_SECONDS - timeDiff;
+          const timeLeft = REQUEST_COOLDOWN_SECONDS - timeDiff;
           return res.json({ 
             can_request: false, 
             time_left_seconds: timeLeft,
@@ -712,7 +646,7 @@ app.listen(PORT, () => {
   console.log(`📝 Cấu hình hệ thống:`);
   console.log(`   - Token TTL: ${TOKEN_TTL_SECONDS} giây`);
   console.log(`   - Key TTL: ${KEY_TTL_SECONDS} giây`);
-  console.log(`   - HWID Cooldown: ${HWID_COOLDOWN_SECONDS} giây`);
+  console.log(`   - Request Cooldown: ${REQUEST_COOLDOWN_SECONDS} giây`);
   console.log(`   - Rate Limit: ${MAX_REQUESTS_PER_IP_PER_MIN} requests/phút`);
   console.log(`   - Linkvertise URL: ${LINKVERITSE_URL}`);
 });
