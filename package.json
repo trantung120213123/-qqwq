@@ -12,7 +12,8 @@
     "sqlite3": "^5.1.6",
     "cookie-parser": "^1.4.6",
     "bcrypt": "^5.1.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.7.2"
   },
   "keywords": [
     "key-system",
