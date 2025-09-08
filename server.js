@@ -5,21 +5,10 @@ const path = require('path');
 const bcrypt = require('bcrypt');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
-const http = require('http');
-const { Server } = require('socket.io');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = 'tungdeptrai1202';
-
-// Create HTTP server and Socket.IO instance
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: '*',
-        methods: ['GET', 'POST']
-    }
-});
 
 // Middleware
 app.use(cors());
@@ -181,6 +170,7 @@ function generateRandomKey(length = 5, prefix = 'key-') {
 function updateUserInfo(user_id, username) {
     if (!user_id) return;
     
+    // Kiểm tra xem user đã tồn tại chưa
     db.get('SELECT * FROM users WHERE user_id = ?', [user_id], (err, row) => {
         if (err) {
             console.error('Lỗi khi kiểm tra user:', err);
@@ -188,6 +178,7 @@ function updateUserInfo(user_id, username) {
         }
         
         if (row) {
+            // Cập nhật thông tin user
             db.run(
                 'UPDATE users SET username = ?, last_seen = CURRENT_TIMESTAMP, total_keys_used = total_keys_used + 1 WHERE user_id = ?',
                 [username, user_id],
@@ -198,6 +189,7 @@ function updateUserInfo(user_id, username) {
                 }
             );
         } else {
+            // Thêm user mới
             db.run(
                 'INSERT INTO users (user_id, username) VALUES (?, ?)',
                 [user_id, username],
@@ -211,7 +203,7 @@ function updateUserInfo(user_id, username) {
     });
 }
 
-// Middleware xác thực vai trò cho HTTP
+// Middleware xác thực vai trò
 function authenticateRole(roles = []) {
     return (req, res, next) => {
         const authHeader = req.headers.authorization;
@@ -238,75 +230,6 @@ function authenticateRole(roles = []) {
     };
 }
 
-// Socket.IO authentication middleware
-io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
-    if (!token) {
-        return next(new Error('Token không hợp lệ'));
-    }
-
-    try {
-        const decoded = jwt.verify(token, SECRET);
-        const userRole = decoded.is_owner ? 'owner' : (decoded.is_super_admin ? 'super_admin' : 'admin');
-        if (!['admin', 'super_admin', 'owner'].includes(userRole)) {
-            return next(new Error('Không có quyền truy cập'));
-        }
-        socket.user = decoded;
-        next();
-    } catch (err) {
-        next(new Error('Token không hợp lệ'));
-    }
-});
-
-// Socket.IO chat handling
-io.on('connection', (socket) => {
-    const username = socket.user.username;
-    console.log(`Admin ${username} connected to chat`);
-
-    // Send chat history on connection
-    db.all('SELECT * FROM admin_chat ORDER BY created_at DESC LIMIT 50', (err, rows) => {
-        if (err) {
-            console.error('Lỗi khi lấy lịch sử chat:', err);
-            return;
-        }
-        socket.emit('history', rows.reverse());
-    });
-
-    // Handle incoming messages
-    socket.on('message', (msg) => {
-        if (!msg || typeof msg !== 'string' || msg.trim() === '') {
-            socket.emit('error', { message: 'Tin nhắn không hợp lệ' });
-            return;
-        }
-
-        const message = msg.trim();
-        db.run('INSERT INTO admin_chat (admin_username, message) VALUES (?, ?)', 
-            [username, message], 
-            function(err) {
-                if (err) {
-                    console.error('Lỗi khi lưu tin nhắn:', err);
-                    socket.emit('error', { message: 'Lỗi khi lưu tin nhắn' });
-                    return;
-                }
-
-                const chatMessage = {
-                    id: this.lastID,
-                    admin_username: username,
-                    message: message,
-                    created_at: new Date().toISOString()
-                };
-
-                // Broadcast message to all connected clients
-                io.emit('message', chatMessage);
-            }
-        );
-    });
-
-    socket.on('disconnect', () => {
-        console.log(`Admin ${username} disconnected from chat`);
-    });
-});
-
 // API tạo key mới với kiểm tra HWID và thời gian 24h
 app.post('/get-key', (req, res) => {
     try {
@@ -321,6 +244,7 @@ app.post('/get-key', (req, res) => {
         
         const now = new Date();
         
+        // Kiểm tra xem HWID đã request key trước đó chưa
         db.get(
             'SELECT * FROM requests WHERE hwid = ?',
             [hwid],
@@ -334,6 +258,7 @@ app.post('/get-key', (req, res) => {
                 }
                 
                 if (row) {
+                    // Kiểm tra thời gian từ lần request cuối
                     const lastRequestTime = new Date(row.last_request_time);
                     const timeDiff = now - lastRequestTime;
                     const hoursDiff = timeDiff / (1000 * 60 * 60);
@@ -350,6 +275,7 @@ app.post('/get-key', (req, res) => {
                         });
                     }
                     
+                    // Cập nhật thời gian request
                     db.run(
                         'UPDATE requests SET last_request_time = ?, request_count = request_count + 1 WHERE hwid = ?',
                         [now.toISOString(), hwid],
@@ -360,6 +286,7 @@ app.post('/get-key', (req, res) => {
                         }
                     );
                 } else {
+                    // Thêm request mới
                     db.run(
                         'INSERT INTO requests (hwid, last_request_time) VALUES (?, ?)',
                         [hwid, now.toISOString()],
@@ -371,8 +298,9 @@ app.post('/get-key', (req, res) => {
                     );
                 }
                 
+                // Tạo key mới
                 const newKey = generateRandomKey(5);
-                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 giờ
                 
                 db.run(
                     'INSERT INTO keys (key, hwid, expires_at) VALUES (?, ?, ?)',
@@ -443,6 +371,7 @@ app.post('/verify-key', (req, res) => {
                     });
                 }
                 
+                // Kiểm tra nếu key bị banned
                 if (row.banned) {
                     return res.json({ 
                         valid: false, 
@@ -450,6 +379,7 @@ app.post('/verify-key', (req, res) => {
                     });
                 }
                 
+                // Kiểm tra hết hạn
                 const now = new Date();
                 const expiresAt = new Date(row.expires_at);
                 if (now > expiresAt && !row.permanent) {
@@ -460,12 +390,14 @@ app.post('/verify-key', (req, res) => {
                 }
                 
                 if (row.used) {
+                    // Kiểm tra nếu key đã được sử dụng bởi user khác
                     if (row.user_id !== user_id) {
                         return res.json({ 
                             valid: false, 
                             reason: 'Key đã được sử dụng bởi user khác' 
                         });
                     }
+                    // Nếu là cùng user thì vẫn hợp lệ
                     return res.json({ 
                         valid: true,
                         user_id: row.user_id,
@@ -476,9 +408,13 @@ app.post('/verify-key', (req, res) => {
                     });
                 }
                 
+                // Cập nhật thông tin user
                 updateUserInfo(user_id, username);
+                
+                // Ghi log hoạt động key
                 logUserKeyActivity(user_id, key, 'verify', `Key verified by ${username}`);
                 
+                // Lưu user_id, username và đánh dấu đã sử dụng
                 db.run(
                     'UPDATE keys SET used = TRUE, user_id = ?, username = ? WHERE key = ?',
                     [user_id, username, key],
@@ -573,6 +509,43 @@ app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_ad
     });
 });
 
+// API lấy tin nhắn chat admin (chỉ admin)
+app.get('/admin/chat', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const limit = req.query.limit || 50;
+    
+    db.all('SELECT * FROM admin_chat ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Lỗi database' });
+        }
+        
+        res.json(rows.reverse()); // Trả về tin nhắn từ cũ đến mới
+    });
+});
+
+// API gửi tin nhắn chat (chỉ admin)
+app.post('/admin/chat', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { message } = req.body;
+    const username = req.user.username;
+    
+    if (!message) {
+        return res.status(400).json({ error: 'Thiếu message' });
+    }
+    
+    db.run('INSERT INTO admin_chat (admin_username, message) VALUES (?, ?)', 
+           [username, message], function(err) {
+        if (err) {
+            console.error('Database error:', err);
+            return res.status(500).json({ error: 'Lỗi khi gửi tin nhắn' });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Tin nhắn đã được gửi'
+        });
+    });
+});
+
 // API ban user (chỉ admin)
 app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const { user_id } = req.body;
@@ -582,6 +555,7 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
+    // Cập nhật cả bảng keys và users
     db.run('UPDATE keys SET banned = TRUE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
@@ -594,6 +568,7 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
                 return res.status(500).json({ error: 'Lỗi database' });
             }
             
+            // Ghi log hoạt động admin
             logAdminActivity(admin_username, 'ban_user', 'user', user_id, `Banned user ${user_id}`);
             
             res.json({ 
@@ -614,6 +589,7 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
+    // Cập nhật cả bảng keys và users
     db.run('UPDATE keys SET banned = FALSE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
@@ -626,6 +602,7 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
                 return res.status(500).json({ error: 'Lỗi database' });
             }
             
+            // Ghi log hoạt động admin
             logAdminActivity(admin_username, 'unban_user', 'user', user_id, `Unbanned user ${user_id}`);
             
             res.json({ 
@@ -647,6 +624,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
     }
     
     if (permanent) {
+        // Đặt key thành vĩnh viễn
         db.run('UPDATE keys SET permanent = TRUE, expires_at = NULL WHERE key = ?', [key], function(err) {
             if (err) {
                 console.error('Database error:', err);
@@ -657,6 +635,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
                 return res.status(404).json({ error: 'Key không tồn tại' });
             }
             
+            // Ghi log hoạt động admin
             logAdminActivity(admin_username, 'update_key', 'key', key, 'Set key to permanent');
             
             res.json({ 
@@ -666,6 +645,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
             });
         });
     } else if (hours) {
+        // Cập nhật thời gian key
         const newExpiry = new Date(Date.now() + hours * 60 * 60 * 1000);
         
         db.run('UPDATE keys SET expires_at = ?, permanent = FALSE WHERE key = ?', [newExpiry.toISOString(), key], function(err) {
@@ -678,6 +658,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
                 return res.status(404).json({ error: 'Key không tồn tại' });
             }
             
+            // Ghi log hoạt động admin
             logAdminActivity(admin_username, 'update_key', 'key', key, `Set key expiry to ${hours} hours`);
             
             res.json({ 
@@ -712,6 +693,7 @@ app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']
                 return res.status(500).json({ error: 'Lỗi khi tạo key' });
             }
             
+            // Ghi log hoạt động admin
             logAdminActivity(admin_username, 'create_key', 'key', newKey, `Created ${permanent ? 'permanent' : hours + ' hours'} key`);
             
             res.json({ 
@@ -740,6 +722,7 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
             return res.status(404).json({ error: 'Key không tồn tại' });
         }
         
+        // Ghi log hoạt động admin
         logAdminActivity(admin_username, 'delete_key', 'key', key, 'Deleted key');
         
         res.json({ 
@@ -758,6 +741,7 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), (req
         return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
     
+    // Kiểm tra xem admin đã tồn tại chưa
     db.get('SELECT * FROM admin WHERE username = ?', [username], (err, row) => {
         if (err) {
             console.error('Database error:', err);
@@ -768,6 +752,7 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), (req
             return res.status(400).json({ error: 'Admin đã tồn tại' });
         }
         
+        // Hash password và tạo admin mới
         bcrypt.hash(password, 10, (err, hash) => {
             if (err) {
                 console.error('Lỗi khi hash password:', err);
@@ -781,6 +766,7 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), (req
                     return res.status(500).json({ error: 'Lỗi khi tạo admin' });
                 }
                 
+                // Ghi log hoạt động admin
                 logAdminActivity(admin_username, 'create_admin', 'admin', username, 'Created new admin');
                 
                 res.json({ 
@@ -797,6 +783,7 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), (req, r
     const { username } = req.params;
     const admin_username = req.user.username;
     
+    // Không cho xóa owner
     if (username === 'owner') {
         return res.status(400).json({ error: 'Không thể xóa owner' });
     }
@@ -811,6 +798,7 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), (req, r
             return res.status(404).json({ error: 'Admin không tồn tại' });
         }
         
+        // Ghi log hoạt động admin
         logAdminActivity(admin_username, 'delete_admin', 'admin', username, 'Deleted admin');
         
         res.json({ 
@@ -829,6 +817,7 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), (req, res) => 
         return res.status(400).json({ error: 'Thiếu username' });
     }
     
+    // Không cho thay đổi quyền owner
     if (username === 'owner') {
         return res.status(400).json({ error: 'Không thể thay đổi quyền owner' });
     }
@@ -844,6 +833,7 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), (req, res) => 
             return res.status(404).json({ error: 'Admin không tồn tại' });
         }
         
+        // Ghi log hoạt động admin
         const action = is_super_admin ? 'promote_admin' : 'demote_admin';
         logAdminActivity(admin_username, action, 'admin', username, 
                         `${is_super_admin ? 'Promoted to' : 'Demoted from'} super admin`);
@@ -1021,6 +1011,7 @@ app.post('/admin/login', (req, res) => {
 app.get('/admin/backup', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const backupPath = path.join(dataDir, `backup-${Date.now()}.db`);
     
+    // Tạo bản sao của database
     fs.copyFile(dbPath, backupPath, (err) => {
         if (err) {
             console.error('Lỗi khi tạo backup:', err);
@@ -1053,7 +1044,7 @@ app.get('/', (req, res) => {
 });
 
 // Khởi động server
-server.listen(PORT, () => {
+app.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
     console.log(`💾 Database được lưu tại: ${dbPath}`);
 });
