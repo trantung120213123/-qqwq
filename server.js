@@ -211,31 +211,37 @@ function updateUserInfo(user_id, username) {
     });
 }
 
-// Middleware xác thực vai trò cho HTTP
+// Thay thế toàn bộ hàm authenticateRole hiện tại bằng đoạn này
 function authenticateRole(roles = []) {
-    return (req, res, next) => {
-        const authHeader = req.headers.authorization;
-        
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'Token không hợp lệ' });
-        }
-        
-        const token = authHeader.substring(7);
-        
-        try {
-            const decoded = jwt.verify(token, SECRET);
-            req.user = decoded;
-            const userRole = decoded.is_owner ? 'owner' : (decoded.is_super_admin ? 'super_admin' : 'admin');
-            
-            if (roles.length === 0 || roles.includes(userRole)) {
-                next();
-            } else {
-                return res.status(403).json({ error: 'Không có quyền truy cập' });
-            }
-        } catch (err) {
-            return res.status(401).json({ error: 'Token không hợp lệ' });
-        }
-    };
+  return (req, res, next) => {
+    // Lấy token từ nhiều nguồn (header Bearer, x-access-token, query token)
+    let token = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else if (req.headers['x-access-token']) {
+      token = req.headers['x-access-token'];
+    } else if (req.query && req.query.token) {
+      token = req.query.token;
+    }
+
+    if (!token) {
+      return res.status(401).json({ error: 'Token không hợp lệ' });
+    }
+
+    try {
+      const decoded = jwt.verify(token, SECRET);
+      req.user = decoded;
+      const userRole = decoded.is_owner ? 'owner' : (decoded.is_super_admin ? 'super_admin' : 'admin');
+      if (roles.length === 0 || roles.includes(userRole)) {
+        next();
+      } else {
+        return res.status(403).json({ error: 'Không có quyền truy cập' });
+      }
+    } catch (err) {
+      return res.status(401).json({ error: 'Token không hợp lệ' });
+    }
+  };
 }
 
 // Socket.IO authentication middleware
