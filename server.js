@@ -696,8 +696,15 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
 app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const { hours = 24, permanent = false, keyPrefix = 'key-' } = req.body;
     const admin_username = req.user.username;
-    
-    const newKey = generateRandomKey(5, keyPrefix);
+
+    // Validate keyPrefix
+    if (typeof keyPrefix !== 'string' || keyPrefix.trim() === '') {
+        console.error('Invalid keyPrefix:', keyPrefix, 'Type:', typeof keyPrefix);
+        return res.status(400).json({ error: 'keyPrefix phải là chuỗi không rỗng' });
+    }
+
+    const safePrefix = keyPrefix.trim();
+    const newKey = generateRandomKey(5, safePrefix);
     let expiresAt = null;
     
     if (!permanent) {
