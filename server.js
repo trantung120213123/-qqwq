@@ -4,9 +4,11 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const bcrypt = require('bcrypt');
 const fs = require('fs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SECRET = 'tungdeptrai1202';
 
 // Middleware
 app.use(cors());
@@ -201,82 +203,31 @@ function updateUserInfo(user_id, username) {
     });
 }
 
-// Middleware xác thực admin
-function authenticateAdmin(req, res, next) {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    next();
-}
-
-// Middleware xác thực super admin
-function authenticateSuperAdmin(req, res, next) {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token admin
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    // Kiểm tra quyền super admin trong database
-    db.get('SELECT * FROM admin WHERE username = ? AND is_super_admin = 1', ['admin'], (err, row) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+// Middleware xác thực vai trò
+function authenticateRole(roles = []) {
+    return (req, res, next) => {
+        const authHeader = req.headers.authorization;
+        
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Token không hợp lệ' });
         }
         
-        if (row) {
-            next();
-        } else {
-            return res.status(403).json({ error: 'Chỉ super admin mới có quyền này' });
-        }
-    });
-}
-
-// Middleware xác thực owner
-function authenticateOwner(req, res, next) {
-    const authHeader = req.headers.authorization;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token không hợp lệ' });
-    }
-    
-    const token = authHeader.substring(7);
-    
-    // Kiểm tra token owner
-    if (token !== 'tungdeptrai1202') {
-        return res.status(403).json({ error: 'Không có quyền truy cập' });
-    }
-    
-    // Kiểm tra quyền owner trong database
-    db.get('SELECT * FROM admin WHERE username = ? AND is_owner = 1', ['owner'], (err, row) => {
-        if (err) {
-            console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
-        }
+        const token = authHeader.substring(7);
         
-        if (row) {
-            next();
-        } else {
-            return res.status(403).json({ error: 'Chỉ owner mới có quyền này' });
+        try {
+            const decoded = jwt.verify(token, SECRET);
+            req.user = decoded;
+            const userRole = decoded.is_owner ? 'owner' : (decoded.is_super_admin ? 'super_admin' : 'admin');
+            
+            if (roles.length === 0 || roles.includes(userRole)) {
+                next();
+            } else {
+                return res.status(403).json({ error: 'Không có quyền truy cập' });
+            }
+        } catch (err) {
+            return res.status(401).json({ error: 'Token không hợp lệ' });
         }
-    });
+    };
 }
 
 // API tạo key mới với kiểm tra HWID và thời gian 24h
@@ -494,7 +445,7 @@ app.post('/verify-key', (req, res) => {
 });
 
 // API lấy danh sách tất cả keys (chỉ admin)
-app.get('/admin/keys', authenticateAdmin, (req, res) => {
+app.get('/admin/keys', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     db.all('SELECT * FROM keys ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
@@ -506,7 +457,7 @@ app.get('/admin/keys', authenticateAdmin, (req, res) => {
 });
 
 // API lấy danh sách tất cả users (chỉ admin)
-app.get('/admin/users', authenticateAdmin, (req, res) => {
+app.get('/admin/users', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     db.all('SELECT * FROM users ORDER BY last_seen DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
@@ -518,7 +469,7 @@ app.get('/admin/users', authenticateAdmin, (req, res) => {
 });
 
 // API lấy danh sách admin (chỉ super admin và owner)
-app.get('/admin/admins', authenticateAdmin, (req, res) => {
+app.get('/admin/admins', authenticateRole(['super_admin', 'owner']), (req, res) => {
     db.all('SELECT id, username, is_super_admin, is_owner, created_at FROM admin ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
@@ -530,7 +481,7 @@ app.get('/admin/admins', authenticateAdmin, (req, res) => {
 });
 
 // API lấy lịch sử hoạt động admin (chỉ owner)
-app.get('/admin/activity', authenticateOwner, (req, res) => {
+app.get('/admin/activity', authenticateRole(['owner']), (req, res) => {
     const limit = req.query.limit || 100;
     
     db.all('SELECT * FROM admin_activity ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => {
@@ -544,7 +495,7 @@ app.get('/admin/activity', authenticateOwner, (req, res) => {
 });
 
 // API lấy lịch sử key của user (chỉ admin)
-app.get('/admin/user-key-history/:user_id', authenticateAdmin, (req, res) => {
+app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const { user_id } = req.params;
     const limit = req.query.limit || 50;
     
@@ -559,7 +510,7 @@ app.get('/admin/user-key-history/:user_id', authenticateAdmin, (req, res) => {
 });
 
 // API lấy tin nhắn chat admin (chỉ admin)
-app.get('/admin/chat', authenticateAdmin, (req, res) => {
+app.get('/admin/chat', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const limit = req.query.limit || 50;
     
     db.all('SELECT * FROM admin_chat ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => {
@@ -573,11 +524,12 @@ app.get('/admin/chat', authenticateAdmin, (req, res) => {
 });
 
 // API gửi tin nhắn chat (chỉ admin)
-app.post('/admin/chat', authenticateAdmin, (req, res) => {
-    const { username, message } = req.body;
+app.post('/admin/chat', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { message } = req.body;
+    const username = req.user.username;
     
-    if (!username || !message) {
-        return res.status(400).json({ error: 'Thiếu username hoặc message' });
+    if (!message) {
+        return res.status(400).json({ error: 'Thiếu message' });
     }
     
     db.run('INSERT INTO admin_chat (admin_username, message) VALUES (?, ?)', 
@@ -595,11 +547,12 @@ app.post('/admin/chat', authenticateAdmin, (req, res) => {
 });
 
 // API ban user (chỉ admin)
-app.post('/admin/ban-user', authenticateAdmin, (req, res) => {
-    const { user_id, admin_username } = req.body;
+app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { user_id } = req.body;
+    const admin_username = req.user.username;
     
-    if (!user_id || !admin_username) {
-        return res.status(400).json({ error: 'Thiếu user_id hoặc admin_username' });
+    if (!user_id) {
+        return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
     // Cập nhật cả bảng keys và users
@@ -628,11 +581,12 @@ app.post('/admin/ban-user', authenticateAdmin, (req, res) => {
 });
 
 // API unban user (chỉ admin)
-app.post('/admin/unban-user', authenticateAdmin, (req, res) => {
-    const { user_id, admin_username } = req.body;
+app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { user_id } = req.body;
+    const admin_username = req.user.username;
     
-    if (!user_id || !admin_username) {
-        return res.status(400).json({ error: 'Thiếu user_id hoặc admin_username' });
+    if (!user_id) {
+        return res.status(400).json({ error: 'Thiếu user_id' });
     }
     
     // Cập nhật cả bảng keys và users
@@ -661,11 +615,12 @@ app.post('/admin/unban-user', authenticateAdmin, (req, res) => {
 });
 
 // API chỉnh sửa thời gian key (chỉ admin)
-app.post('/admin/update-key-expiry', authenticateAdmin, (req, res) => {
-    const { key, hours, permanent, admin_username } = req.body;
+app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { key, hours, permanent } = req.body;
+    const admin_username = req.user.username;
     
-    if (!key || !admin_username) {
-        return res.status(400).json({ error: 'Thiếu key hoặc admin_username' });
+    if (!key) {
+        return res.status(400).json({ error: 'Thiếu key' });
     }
     
     if (permanent) {
@@ -719,12 +674,9 @@ app.post('/admin/update-key-expiry', authenticateAdmin, (req, res) => {
 });
 
 // API tạo key mới (chỉ admin)
-app.post('/admin/create-key', authenticateAdmin, (req, res) => {
-    const { hours = 24, permanent = false, keyPrefix = 'key-', admin_username } = req.body;
-    
-    if (!admin_username) {
-        return res.status(400).json({ error: 'Thiếu admin_username' });
-    }
+app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
+    const { hours = 24, permanent = false, keyPrefix = 'key-' } = req.body;
+    const admin_username = req.user.username;
     
     const newKey = generateRandomKey(5, keyPrefix);
     let expiresAt = null;
@@ -756,13 +708,9 @@ app.post('/admin/create-key', authenticateAdmin, (req, res) => {
 });
 
 // API xóa key (chỉ admin)
-app.delete('/admin/delete-key/:key', authenticateAdmin, (req, res) => {
+app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const { key } = req.params;
-    const { admin_username } = req.query;
-    
-    if (!admin_username) {
-        return res.status(400).json({ error: 'Thiếu admin_username' });
-    }
+    const admin_username = req.user.username;
     
     db.run('DELETE FROM keys WHERE key = ?', [key], function(err) {
         if (err) {
@@ -785,11 +733,12 @@ app.delete('/admin/delete-key/:key', authenticateAdmin, (req, res) => {
 });
 
 // API tạo admin mới (chỉ super admin và owner)
-app.post('/admin/create-admin', authenticateSuperAdmin, (req, res) => {
-    const { username, password, admin_username } = req.body;
+app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), (req, res) => {
+    const { username, password } = req.body;
+    const admin_username = req.user.username;
     
-    if (!username || !password || !admin_username) {
-        return res.status(400).json({ error: 'Thiếu username, password hoặc admin_username' });
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
     
     // Kiểm tra xem admin đã tồn tại chưa
@@ -830,13 +779,9 @@ app.post('/admin/create-admin', authenticateSuperAdmin, (req, res) => {
 });
 
 // API xóa admin (chỉ owner)
-app.delete('/admin/delete-admin/:username', authenticateOwner, (req, res) => {
+app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), (req, res) => {
     const { username } = req.params;
-    const { admin_username } = req.query;
-    
-    if (!admin_username) {
-        return res.status(400).json({ error: 'Thiếu admin_username' });
-    }
+    const admin_username = req.user.username;
     
     // Không cho xóa owner
     if (username === 'owner') {
@@ -864,11 +809,12 @@ app.delete('/admin/delete-admin/:username', authenticateOwner, (req, res) => {
 });
 
 // API cập nhật quyền admin (chỉ owner)
-app.post('/admin/update-admin-role', authenticateOwner, (req, res) => {
-    const { username, is_super_admin, admin_username } = req.body;
+app.post('/admin/update-admin-role', authenticateRole(['owner']), (req, res) => {
+    const { username, is_super_admin } = req.body;
+    const admin_username = req.user.username;
     
-    if (!username || !admin_username) {
-        return res.status(400).json({ error: 'Thiếu username hoặc admin_username' });
+    if (!username) {
+        return res.status(400).json({ error: 'Thiếu username' });
     }
     
     // Không cho thay đổi quyền owner
@@ -1041,9 +987,15 @@ app.post('/admin/login', (req, res) => {
             }
             
             if (result) {
+                const token = jwt.sign({ 
+                    username: row.username,
+                    is_super_admin: row.is_super_admin,
+                    is_owner: row.is_owner 
+                }, SECRET, { expiresIn: '1d' });
+                
                 res.json({ 
                     success: true, 
-                    token: 'tungdeptrai1202',
+                    token,
                     is_super_admin: row.is_super_admin,
                     is_owner: row.is_owner,
                     message: 'Đăng nhập thành công'
@@ -1056,7 +1008,7 @@ app.post('/admin/login', (req, res) => {
 });
 
 // API backup database (chỉ admin)
-app.get('/admin/backup', authenticateAdmin, (req, res) => {
+app.get('/admin/backup', authenticateRole(['admin', 'super_admin', 'owner']), (req, res) => {
     const backupPath = path.join(dataDir, `backup-${Date.now()}.db`);
     
     // Tạo bản sao của database
