@@ -519,7 +519,7 @@ app.get('/admin/keys', authenticateRole(['admin', 'super_admin', 'owner']), (req
     db.all('SELECT * FROM keys ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         res.json(rows);
@@ -531,7 +531,7 @@ app.get('/admin/users', authenticateRole(['admin', 'super_admin', 'owner']), (re
     db.all('SELECT * FROM users ORDER BY last_seen DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         res.json(rows);
@@ -543,7 +543,7 @@ app.get('/admin/admins', authenticateRole(['super_admin', 'owner']), (req, res) 
     db.all('SELECT id, username, is_super_admin, is_owner, created_at FROM admin ORDER BY created_at DESC', (err, rows) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         res.json(rows);
@@ -557,7 +557,7 @@ app.get('/admin/activity', authenticateRole(['owner']), (req, res) => {
     db.all('SELECT * FROM admin_activity ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         res.json(rows);
@@ -572,7 +572,7 @@ app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_ad
     db.all('SELECT * FROM user_key_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?', [user_id, limit], (err, rows) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         res.json(rows);
@@ -591,13 +591,13 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
     db.run('UPDATE keys SET banned = TRUE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         db.run('UPDATE users SET banned = TRUE WHERE user_id = ?', [user_id], function(err) {
             if (err) {
                 console.error('Database error:', err);
-                return res.status(500).json({ error: 'Lỗi database' });
+                return res.status(500).json({ error: 'Lỗi database: ' + err.message });
             }
             
             logAdminActivity(admin_username, 'ban_user', 'user', user_id, `Banned user ${user_id}`);
@@ -623,13 +623,13 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
     db.run('UPDATE keys SET banned = FALSE WHERE user_id = ?', [user_id], function(err) {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         db.run('UPDATE users SET banned = FALSE WHERE user_id = ?', [user_id], function(err) {
             if (err) {
                 console.error('Database error:', err);
-                return res.status(500).json({ error: 'Lỗi database' });
+                return res.status(500).json({ error: 'Lỗi database: ' + err.message });
             }
             
             logAdminActivity(admin_username, 'unban_user', 'user', user_id, `Unbanned user ${user_id}`);
@@ -656,7 +656,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
         db.run('UPDATE keys SET permanent = TRUE, expires_at = NULL WHERE key = ?', [key], function(err) {
             if (err) {
                 console.error('Database error:', err);
-                return res.status(500).json({ error: 'Lỗi database' });
+                return res.status(500).json({ error: 'Lỗi database: ' + err.message });
             }
             
             if (this.changes === 0) {
@@ -677,7 +677,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
         db.run('UPDATE keys SET expires_at = ?, permanent = FALSE WHERE key = ?', [newExpiry.toISOString(), key], function(err) {
             if (err) {
                 console.error('Database error:', err);
-                return res.status(500).json({ error: 'Lỗi database' });
+                return res.status(500).json({ error: 'Lỗi database: ' + err.message });
             }
             
             if (this.changes === 0) {
@@ -746,7 +746,7 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
     db.run('DELETE FROM keys WHERE key = ?', [key], function(err) {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         if (this.changes === 0) {
@@ -774,7 +774,7 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), (req
     db.get('SELECT * FROM admin WHERE username = ?', [username], (err, row) => {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         if (row) {
@@ -817,7 +817,7 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), (req, r
     db.run('DELETE FROM admin WHERE username = ?', [username], function(err) {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         if (this.changes === 0) {
@@ -850,7 +850,7 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), (req, res) => 
            [is_super_admin, username], function(err) {
         if (err) {
             console.error('Database error:', err);
-            return res.status(500).json({ error: 'Lỗi database' });
+            return res.status(500).json({ error: 'Lỗi database: ' + err.message });
         }
         
         if (this.changes === 0) {
@@ -878,7 +878,7 @@ app.get('/key-info/:key', (req, res) => {
         (err, row) => {
             if (err) {
                 return res.status(500).json({ 
-                    error: 'Lỗi database' 
+                    error: 'Lỗi database: ' + err.message 
                 });
             }
             
@@ -1063,6 +1063,46 @@ app.get('/', (req, res) => {
             adminBackup: 'GET /admin/backup'
         }
     });
+});
+
+// API verify token (mới thêm)
+app.post('/admin/verify-token', (req, res) => {
+    const token = req.headers.authorization?.substring(7) || req.headers['x-access-token'] || req.query.token;
+    if (!token) {
+        return res.status(401).json({ error: 'Token không hợp lệ' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, SECRET);
+        res.json({
+            success: true,
+            username: decoded.username,
+            is_super_admin: decoded.is_super_admin,
+            is_owner: decoded.is_owner
+        });
+    } catch (err) {
+        res.status(401).json({ error: 'Token không hợp lệ hoặc đã hết hạn' });
+    }
+});
+
+// API refresh token (mới thêm)
+app.post('/admin/refresh-token', (req, res) => {
+    const token = req.headers.authorization?.substring(7) || req.headers['x-access-token'] || req.query.token;
+    try {
+        const decoded = jwt.verify(token, SECRET, { ignoreExpiration: true });
+        const newToken = jwt.sign(
+            {
+                username: decoded.username,
+                is_super_admin: decoded.is_super_admin,
+                is_owner: decoded.is_owner
+            },
+            SECRET,
+            { expiresIn: '1d' }
+        );
+        res.json({ success: true, token: newToken });
+    } catch (err) {
+        res.status(401).json({ error: 'Token không hợp lệ' });
+    }
 });
 
 // Khởi động server
