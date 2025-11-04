@@ -1028,7 +1028,7 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Admin login endpoint (async)
+// Admin login endpoint (async, với bypass cho owner)
 app.post('/admin/login', async (req, res) => {
     const { username, password } = req.body;
   
@@ -1036,39 +1036,61 @@ app.post('/admin/login', async (req, res) => {
         return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
   
-    const { data: row, error } = await supabase
-        .from('admin')
-        .select('*')
-        .eq('username', username)
-        .single();
-
-    if (error) {
-        console.error('Database error:', error);
-        return res.status(500).json({ error: 'Lỗi server' });
-    }
-  
-    if (!row) {
-        return res.status(401).json({ error: 'Sai thông tin đăng nhập' });
-    }
-  
-    const result = await bcrypt.compare(password, row.password);
-  
-    if (result) {
-        const token = jwt.sign({
-            username: row.username,
-            is_super_admin: row.is_super_admin,
-            is_owner: row.is_owner
-        }, SECRET, { expiresIn: '1d' });
+    if (username === 'owner') {
+        // Bypass database cho owner: Hardcode check password
+        if (password === 'tungdeptrai1202') {
+            const token = jwt.sign({
+                username: 'owner',
+                is_super_admin: true,  // Owner luôn có quyền super_admin
+                is_owner: true
+            }, SECRET, { expiresIn: '1d' });
       
-        res.json({
-            success: true,
-            token,
-            is_super_admin: row.is_super_admin,
-            is_owner: row.is_owner,
-            message: 'Đăng nhập thành công'
-        });
+            return res.json({
+                success: true,
+                token,
+                is_super_admin: true,
+                is_owner: true,
+                message: 'Đăng nhập thành công (owner bypass)'
+            });
+        } else {
+            return res.status(401).json({ error: 'Sai thông tin đăng nhập' });
+        }
     } else {
-        res.status(401).json({ error: 'Sai thông tin đăng nhập' });
+        // Đối với admin khác: Vẫn dùng database như cũ
+        const { data: row, error } = await supabase
+            .from('admin')
+            .select('*')
+            .eq('username', username)
+            .single();
+
+        if (error) {
+            console.error('Database error:', error);
+            return res.status(500).json({ error: 'Lỗi server' });
+        }
+  
+        if (!row) {
+            return res.status(401).json({ error: 'Sai thông tin đăng nhập' });
+        }
+  
+        const result = await bcrypt.compare(password, row.password);
+  
+        if (result) {
+            const token = jwt.sign({
+                username: row.username,
+                is_super_admin: row.is_super_admin,
+                is_owner: row.is_owner
+            }, SECRET, { expiresIn: '1d' });
+      
+            res.json({
+                success: true,
+                token,
+                is_super_admin: row.is_super_admin,
+                is_owner: row.is_owner,
+                message: 'Đăng nhập thành công'
+            });
+        } else {
+            res.status(401).json({ error: 'Sai thông tin đăng nhập' });
+        }
     }
 });
 
