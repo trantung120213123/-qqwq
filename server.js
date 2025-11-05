@@ -7,22 +7,18 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = 'tungdeptrai1202';
-
 // Supabase config
 const SUPABASE_URL = 'https://wxlxlhbfuezfvtbshwsw.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind4bHhsaGJmdWV6ZnZ0YnNod3N3Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MjIzODYzNiwiZXhwIjoyMDc3ODE0NjM2fQ.a9AoVbSciixxREtvQz31auD0hnMADdpit2HuzkShhMA';
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: {
         autoRefreshToken: false,
         persistSession: false
     }
 });
-
 // Create HTTP server and Socket.IO instance
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -31,15 +27,13 @@ const io = new Server(server, {
         methods: ['GET', 'POST']
     }
 });
-
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
-
-// Khởi tạo database: Tạo bảng nếu chưa có (Supabase tự handle schema, nhưng có thể dùng RPC hoặc migration tool; ở đây giả sử schema đã tạo từ SQL trước)
+// Khởi tạo database: Chỉ thêm owner mặc định nếu chưa có (bảng đã tồn tại)
 async function initializeSupabase() {
-    console.log('✅ Supabase client đã sẵn sàng. Giả sử schema đã được tạo từ SQL script trước đó.');
+    console.log('✅ Supabase client đã sẵn sàng. Bảng đã được tạo sẵn.');
     
     // Thêm owner mặc định nếu chưa có
     const ownerPassword = 'tungdeptrai1202';
@@ -48,12 +42,10 @@ async function initializeSupabase() {
         .select('username')
         .eq('username', 'owner')
         .single();
-
     if (checkError && checkError.code !== 'PGRST116') { // PGRST116: no rows
         console.error('Lỗi kiểm tra owner:', checkError);
         return;
     }
-
     if (!existingOwner) {
         const hash = await bcrypt.hash(ownerPassword, 10);
         const { error: insertError } = await supabase
@@ -64,7 +56,6 @@ async function initializeSupabase() {
                 is_super_admin: true,
                 is_owner: true
             });
-
         if (insertError) {
             console.error('Lỗi khi tạo owner mặc định:', insertError);
         } else {
@@ -74,10 +65,8 @@ async function initializeSupabase() {
         console.log('Owner đã tồn tại, bỏ qua tạo mới.');
     }
 }
-
 // Gọi init khi start server
 initializeSupabase().catch(console.error);
-
 // Hàm ghi log hoạt động admin (async)
 async function logAdminActivity(adminUsername, action, targetType = null, targetValue = null, details = null) {
     const { error } = await supabase
@@ -89,12 +78,10 @@ async function logAdminActivity(adminUsername, action, targetType = null, target
             target_value: targetValue,
             details
         });
-
     if (error) {
         console.error('Lỗi khi ghi log hoạt động admin:', error);
     }
 }
-
 // Hàm ghi log hoạt động key của user (async)
 async function logUserKeyActivity(userId, key, action, details = null) {
     const { error } = await supabase
@@ -105,12 +92,10 @@ async function logUserKeyActivity(userId, key, action, details = null) {
             action,
             details
         });
-
     if (error) {
         console.error('Lỗi khi ghi log hoạt động key của user:', error);
     }
 }
-
 // Hàm tạo key ngẫu nhiên
 function generateRandomKey(length = 5, prefix = 'key-') {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -120,22 +105,18 @@ function generateRandomKey(length = 5, prefix = 'key-') {
     }
     return `${prefix}${result}`;
 }
-
 // Hàm cập nhật thông tin user (async)
 async function updateUserInfo(user_id, username) {
     if (!user_id) return;
-
     const { data: existingUser, error: checkError } = await supabase
         .from('users')
         .select('*')
         .eq('user_id', user_id)
         .single();
-
     if (checkError && checkError.code !== 'PGRST116') {
         console.error('Lỗi khi kiểm tra user:', checkError);
         return;
     }
-
     if (existingUser) {
         const { error: updateError } = await supabase
             .from('users')
@@ -145,7 +126,6 @@ async function updateUserInfo(user_id, username) {
                 total_keys_used: existingUser.total_keys_used + 1
             })
             .eq('user_id', user_id);
-
         if (updateError) {
             console.error('Lỗi khi cập nhật user:', updateError);
         }
@@ -156,13 +136,11 @@ async function updateUserInfo(user_id, username) {
                 user_id,
                 username
             });
-
         if (insertError) {
             console.error('Lỗi khi thêm user mới:', insertError);
         }
     }
 }
-
 // Hàm authenticateRole (giữ nguyên)
 function authenticateRole(roles = []) {
     return async (req, res, next) => {
@@ -192,7 +170,6 @@ function authenticateRole(roles = []) {
         }
     };
 }
-
 // Socket.IO authentication middleware (giữ nguyên, nhưng chat dùng Supabase async)
 io.use((socket, next) => {
     const token = socket.handshake.auth.token;
@@ -211,7 +188,6 @@ io.use((socket, next) => {
         next(new Error('Token không hợp lệ'));
     }
 });
-
 // Socket.IO chat handling (async Supabase)
 io.on('connection', async (socket) => {
     const username = socket.user.username;
@@ -223,13 +199,11 @@ io.on('connection', async (socket) => {
         .select('*')
         .order('created_at', { ascending: false })
         .limit(50);
-
     if (error) {
         console.error('Lỗi khi lấy lịch sử chat:', error);
         return;
     }
     socket.emit('history', rows.reverse());
-
     // Handle incoming messages
     socket.on('message', async (msg) => {
         if (!msg || typeof msg !== 'string' || msg.trim() === '') {
@@ -245,13 +219,11 @@ io.on('connection', async (socket) => {
             })
             .select()
             .single();
-
         if (insertError) {
             console.error('Lỗi khi lưu tin nhắn:', insertError);
             socket.emit('error', { message: 'Lỗi khi lưu tin nhắn' });
             return;
         }
-
         const chatMessage = {
             id: newMessage.id,
             admin_username: username,
@@ -261,12 +233,10 @@ io.on('connection', async (socket) => {
         // Broadcast message to all connected clients
         io.emit('message', chatMessage);
     });
-
     socket.on('disconnect', () => {
         console.log(`Admin ${username} disconnected from chat`);
     });
 });
-
 // API tạo key mới với kiểm tra HWID và thời gian 24h (async)
 app.post('/get-key', async (req, res) => {
     try {
@@ -286,7 +256,6 @@ app.post('/get-key', async (req, res) => {
             .select('*')
             .eq('hwid', hwid)
             .single();
-
         if (selectError && selectError.code !== 'PGRST116') {
             console.error('Database error:', selectError);
             return res.status(500).json({
@@ -319,7 +288,6 @@ app.post('/get-key', async (req, res) => {
                     request_count: row.request_count + 1
                 })
                 .eq('hwid', hwid);
-
             if (updateError) {
                 console.error('Update request error:', updateError);
             }
@@ -330,7 +298,6 @@ app.post('/get-key', async (req, res) => {
                     hwid,
                     last_request_time: now.toISOString()
                 });
-
             if (insertError) {
                 console.error('Insert request error:', insertError);
             }
@@ -348,7 +315,6 @@ app.post('/get-key', async (req, res) => {
             })
             .select()
             .single();
-
         if (insertKeyError) {
             console.error('Insert key error:', insertKeyError);
             return res.status(500).json({
@@ -371,7 +337,6 @@ app.post('/get-key', async (req, res) => {
         });
     }
 });
-
 // API xác thực key (async)
 app.post('/verify-key', async (req, res) => {
     try {
@@ -396,7 +361,6 @@ app.post('/verify-key', async (req, res) => {
             .select('*')
             .eq('key', key)
             .single();
-
         if (selectError) {
             console.error('Database error:', selectError);
             return res.status(500).json({
@@ -456,7 +420,6 @@ app.post('/verify-key', async (req, res) => {
                 username
             })
             .eq('key', key);
-
         if (updateError) {
             console.error('Lỗi khi cập nhật key:', updateError);
         }
@@ -477,90 +440,94 @@ app.post('/verify-key', async (req, res) => {
         });
     }
 });
+// Helper function for pagination
+async function getPaginatedData(table, selectFields = '*', orderBy = null, filters = {}, page = 1, limit = 10) {
+    const start = (page - 1) * limit;
+    const end = start + limit - 1;
 
-// API lấy danh sách tất cả keys (async)
+    // Build query for data
+    let query = supabase.from(table).select(selectFields, { count: 'exact' });
+    if (orderBy) {
+        query = query.order(orderBy.field, { ascending: orderBy.ascending !== false });
+    }
+    for (const [key, value] of Object.entries(filters)) {
+        query = query.eq(key, value);
+    }
+    const { data, error, count } = await query.range(start, end);
+
+    if (error) {
+        throw error;
+    }
+
+    return {
+        data: data || [],
+        total: count || 0,
+        page,
+        limit,
+        total_pages: Math.ceil((count || 0) / limit)
+    };
+}
+// API lấy danh sách tất cả keys (async) với phân trang
 app.get('/admin/keys', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
-        .from('keys')
-        .select('*')
-        .order('created_at', { ascending: false });
-
-    if (error) {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const result = await getPaginatedData('keys', '*', { field: 'created_at', ascending: false }, {}, page, limit);
+        res.json(result);
+    } catch (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
 });
-
-// API lấy danh sách tất cả users (async)
+// API lấy danh sách tất cả users (async) với phân trang
 app.get('/admin/users', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
-        .from('users')
-        .select('*')
-        .order('last_seen', { ascending: false });
-
-    if (error) {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const result = await getPaginatedData('users', '*', { field: 'last_seen', ascending: false }, {}, page, limit);
+        res.json(result);
+    } catch (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
 });
-
-// API lấy danh sách admin (async)
+// API lấy danh sách admin (async) với phân trang
 app.get('/admin/admins', authenticateRole(['super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
-        .from('admin')
-        .select('id, username, is_super_admin, is_owner, created_at')
-        .order('created_at', { ascending: false });
-
-    if (error) {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const result = await getPaginatedData('admin', 'id, username, is_super_admin, is_owner, created_at', { field: 'created_at', ascending: false }, {}, page, limit);
+        res.json(result);
+    } catch (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
 });
-
-// API lấy lịch sử hoạt động admin (async)
+// API lấy lịch sử hoạt động admin (async) với phân trang
 app.get('/admin/activity', authenticateRole(['owner']), async (req, res) => {
-    const limit = parseInt(req.query.limit) || 100;
-  
-    const { data: rows, error } = await supabase
-        .from('admin_activity')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(limit);
-
-    if (error) {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 100;
+        const result = await getPaginatedData('admin_activity', '*', { field: 'created_at', ascending: false }, {}, page, limit);
+        res.json(result);
+    } catch (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
 });
-
-// API lấy lịch sử key của user (async)
+// API lấy lịch sử key của user (async) với phân trang
 app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    const { user_id } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
-  
-    const { data: rows, error } = await supabase
-        .from('user_key_history')
-        .select('*')
-        .eq('user_id', user_id)
-        .order('created_at', { ascending: false })
-        .limit(limit);
-
-    if (error) {
+    try {
+        const { user_id } = req.params;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 50;
+        const result = await getPaginatedData('user_key_history', '*', { field: 'created_at', ascending: false }, { user_id }, page, limit);
+        res.json(result);
+    } catch (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
 });
-
 // API ban user (async)
 app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { user_id } = req.body;
@@ -574,7 +541,6 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         .from('keys')
         .update({ banned: true })
         .eq('user_id', user_id);
-
     if (keysError) {
         console.error('Database error:', keysError);
         return res.status(500).json({ error: 'Lỗi database: ' + keysError.message });
@@ -584,7 +550,6 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         .from('users')
         .update({ banned: true })
         .eq('user_id', user_id);
-
     if (usersError) {
         console.error('Database error:', usersError);
         return res.status(500).json({ error: 'Lỗi database: ' + usersError.message });
@@ -597,7 +562,6 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         .from('users')
         .select('*', { count: 'exact', head: true })
         .eq('user_id', user_id); // Thay bằng count affected nếu cần, nhưng đơn giản dùng 1
-
     if (countError) {
         console.error('Count error:', countError);
         changes = 1; // Fallback
@@ -609,7 +573,6 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         changes: changes || 1
     });
 });
-
 // API unban user (async) - Tương tự ban, chỉ đổi FALSE
 app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { user_id } = req.body;
@@ -623,7 +586,6 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         .from('keys')
         .update({ banned: false })
         .eq('user_id', user_id);
-
     if (keysError) {
         console.error('Database error:', keysError);
         return res.status(500).json({ error: 'Lỗi database: ' + keysError.message });
@@ -633,7 +595,6 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         .from('users')
         .update({ banned: false })
         .eq('user_id', user_id);
-
     if (usersError) {
         console.error('Database error:', usersError);
         return res.status(500).json({ error: 'Lỗi database: ' + usersError.message });
@@ -647,7 +608,6 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         changes: 1 // Fallback
     });
 });
-
 // API chỉnh sửa thời gian key (async)
 app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { key, hours, permanent } = req.body;
@@ -664,19 +624,16 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
             .from('keys')
             .update(updateData)
             .eq('key', key);
-
         if (error) {
             console.error('Database error:', error);
             return res.status(500).json({ error: 'Lỗi database: ' + error.message });
         }
-
         // Check if updated
         const { data: updatedRow } = await supabase
             .from('keys')
             .select('key')
             .eq('key', key)
             .single();
-
         if (!updatedRow) {
             return res.status(404).json({ error: 'Key không tồn tại' });
         }
@@ -696,18 +653,15 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
             .from('keys')
             .update(updateData)
             .eq('key', key);
-
         if (error) {
             console.error('Database error:', error);
             return res.status(500).json({ error: 'Lỗi database: ' + error.message });
         }
-
         const { data: updatedRow } = await supabase
             .from('keys')
             .select('key')
             .eq('key', key)
             .single();
-
         if (!updatedRow) {
             return res.status(404).json({ error: 'Key không tồn tại' });
         }
@@ -724,7 +678,6 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
         return res.status(400).json({ error: 'Thiếu hours hoặc permanent' });
     }
 });
-
 // API tạo key mới (async)
 app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { hours = 24, permanent = false, keyPrefix = 'key-' } = req.body;
@@ -750,7 +703,6 @@ app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']
         })
         .select()
         .single();
-
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi khi tạo key' });
@@ -766,7 +718,6 @@ app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']
         message: 'Key đã được tạo thành công'
     });
 });
-
 // API xóa key (async)
 app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { key } = req.params;
@@ -777,7 +728,6 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
         .delete()
         .eq('key', key)
         .select('key', { count: 'exact', head: true });
-
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
@@ -794,7 +744,6 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
         message: `Đã xóa key ${key}`
     });
 });
-
 // API tạo admin mới (async)
 app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), async (req, res) => {
     const { username, password } = req.body;
@@ -809,7 +758,6 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
         .select('*')
         .eq('username', username)
         .single();
-
     if (checkError && checkError.code !== 'PGRST116') {
         console.error('Database error:', checkError);
         return res.status(500).json({ error: 'Lỗi database: ' + checkError.message });
@@ -826,7 +774,6 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
             username,
             password: hash
         });
-
     if (insertError) {
         console.error('Database error:', insertError);
         return res.status(500).json({ error: 'Lỗi khi tạo admin' });
@@ -839,7 +786,6 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
         message: `Đã tạo admin ${username} thành công`
     });
 });
-
 // API xóa admin (async)
 app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (req, res) => {
     const { username } = req.params;
@@ -854,7 +800,6 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (
         .delete()
         .eq('username', username)
         .select('username', { count: 'exact', head: true });
-
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
@@ -871,7 +816,6 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (
         message: `Đã xóa admin ${username}`
     });
 });
-
 // API cập nhật quyền admin (async)
 app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, res) => {
     const { username, is_super_admin } = req.body;
@@ -890,7 +834,6 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, re
         .update({ is_super_admin })
         .eq('username', username)
         .select('username', { count: 'exact', head: true });
-
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
@@ -909,7 +852,6 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, re
         message: `Đã ${is_super_admin ? 'thăng cấp' : 'hạ cấp'} admin ${username}`
     });
 });
-
 // API kiểm tra key info (async)
 app.get('/key-info/:key', async (req, res) => {
     const { key } = req.params;
@@ -919,7 +861,6 @@ app.get('/key-info/:key', async (req, res) => {
         .select('*')
         .eq('key', key)
         .single();
-
     if (error) {
         return res.status(500).json({
             error: 'Lỗi database: ' + error.message
@@ -951,7 +892,6 @@ app.get('/key-info/:key', async (req, res) => {
         is_expired: isExpired && !row.permanent
     });
 });
-
 // API kiểm tra thời gian chờ còn lại theo HWID (async)
 app.post('/check-time-left', async (req, res) => {
     try {
@@ -969,7 +909,6 @@ app.post('/check-time-left', async (req, res) => {
             .select('*')
             .eq('hwid', hwid)
             .single();
-
         if (selectError && selectError.code !== 'PGRST116') {
             console.error('Database error:', selectError);
             return res.status(500).json({
@@ -1016,7 +955,6 @@ app.post('/check-time-left', async (req, res) => {
         });
     }
 });
-
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -1027,7 +965,6 @@ app.get('/health', (req, res) => {
         url: SUPABASE_URL
     });
 });
-
 // Admin login endpoint (async, với bypass cho owner)
 app.post('/admin/login', async (req, res) => {
     const { username, password } = req.body;
@@ -1041,7 +978,7 @@ app.post('/admin/login', async (req, res) => {
         if (password === 'tungdeptrai1202') {
             const token = jwt.sign({
                 username: 'owner',
-                is_super_admin: true,  // Owner luôn có quyền super_admin
+                is_super_admin: true, // Owner luôn có quyền super_admin
                 is_owner: true
             }, SECRET, { expiresIn: '1d' });
       
@@ -1062,7 +999,6 @@ app.post('/admin/login', async (req, res) => {
             .select('*')
             .eq('username', username)
             .single();
-
         if (error) {
             console.error('Database error:', error);
             return res.status(500).json({ error: 'Lỗi server' });
@@ -1093,7 +1029,6 @@ app.post('/admin/login', async (req, res) => {
         }
     }
 });
-
 // API backup: Với Supabase, dùng export data hoặc skip (ở đây log info)
 app.get('/admin/backup', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     // Supabase không có direct backup như file, gợi ý dùng Supabase dashboard hoặc pg_dump
@@ -1103,7 +1038,6 @@ app.get('/admin/backup', authenticateRole(['admin', 'super_admin', 'owner']), as
         guide: 'https://supabase.com/docs/guides/database/backups'
     });
 });
-
 // Root endpoint
 app.get('/', (req, res) => {
     res.json({
@@ -1120,7 +1054,6 @@ app.get('/', (req, res) => {
         }
     });
 });
-
 // API verify token (giữ nguyên)
 app.post('/admin/verify-token', (req, res) => {
     const token = req.headers.authorization?.substring(7) || req.headers['x-access-token'] || req.query.token;
@@ -1139,7 +1072,6 @@ app.post('/admin/verify-token', (req, res) => {
         res.status(401).json({ error: 'Token không hợp lệ hoặc đã hết hạn' });
     }
 });
-
 // API refresh token (giữ nguyên)
 app.post('/admin/refresh-token', (req, res) => {
     const token = req.headers.authorization?.substring(7) || req.headers['x-access-token'] || req.query.token;
@@ -1159,10 +1091,9 @@ app.post('/admin/refresh-token', (req, res) => {
         res.status(401).json({ error: 'Token không hợp lệ' });
     }
 });
-
 // Khởi động server
 server.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
-    console.log(`☁️  Supabase URL: ${SUPABASE_URL}`);
+    console.log(`☁️ Supabase URL: ${SUPABASE_URL}`);
     console.log(`🔑 Service Role Key: ${SUPABASE_SERVICE_ROLE_KEY.substring(0, 20)}... (đã load thành công)`);
 });
