@@ -34,7 +34,7 @@ app.use(express.static('public'));
 // Khởi tạo database: Tạo bảng nếu chưa có (Supabase tự handle schema, nhưng có thể dùng RPC hoặc migration tool; ở đây giả sử schema đã tạo từ SQL trước)
 async function initializeSupabase() {
     console.log('✅ Supabase client đã sẵn sàng. Giả sử schema đã được tạo từ SQL script trước đó.');
-    
+   
     // Thêm owner mặc định nếu chưa có
     const ownerPassword = 'tungdeptrai1202';
     const { data: existingOwner, error: checkError } = await supabase
@@ -192,7 +192,7 @@ io.use((socket, next) => {
 io.on('connection', async (socket) => {
     const username = socket.user.username;
     console.log(`Admin ${username} connected to chat`);
-    
+   
     // Send chat history on connection
     const { data: rows, error } = await supabase
         .from('admin_chat')
@@ -241,16 +241,16 @@ io.on('connection', async (socket) => {
 app.post('/get-key', async (req, res) => {
     try {
         const { hwid } = req.body;
-      
+     
         if (!hwid) {
             return res.status(400).json({
                 success: false,
                 message: 'Thiếu HWID'
             });
         }
-      
+     
         const now = new Date();
-      
+     
         const { data: row, error: selectError } = await supabase
             .from('requests')
             .select('*')
@@ -263,24 +263,24 @@ app.post('/get-key', async (req, res) => {
                 message: 'Lỗi server'
             });
         }
-      
+     
         if (row) {
             const lastRequestTime = new Date(row.last_request_time);
             const timeDiff = now - lastRequestTime;
             const hoursDiff = timeDiff / (1000 * 60 * 60);
-          
+         
             if (hoursDiff < 1) {
                 const timeLeft = 1 - hoursDiff;
                 const hoursLeft = Math.floor(timeLeft);
                 const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
-              
+             
                 return res.status(429).json({
                     success: false,
                     message: `Bạn phải chờ ${hoursLeft} giờ ${minutesLeft} phút nữa để lấy key mới`,
                     time_left: timeLeft
                 });
             }
-          
+         
             const { error: updateError } = await supabase
                 .from('requests')
                 .update({
@@ -302,10 +302,10 @@ app.post('/get-key', async (req, res) => {
                 console.error('Insert request error:', insertError);
             }
         }
-      
+     
         const newKey = generateRandomKey(5);
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      
+     
         const { data: insertedKey, error: insertKeyError } = await supabase
             .from('keys')
             .insert({
@@ -322,7 +322,7 @@ app.post('/get-key', async (req, res) => {
                 message: 'Lỗi khi tạo key'
             });
         }
-      
+     
         res.json({
             success: true,
             key: newKey,
@@ -341,21 +341,21 @@ app.post('/get-key', async (req, res) => {
 app.post('/verify-key', async (req, res) => {
     try {
         const { key, user_id, username } = req.body;
-      
+     
         if (!key) {
             return res.json({
                 valid: false,
                 reason: 'Thiếu key'
             });
         }
-      
+     
         if (!user_id) {
             return res.json({
                 valid: false,
                 reason: 'Thiếu user_id'
             });
         }
-      
+     
         const { data: row, error: selectError } = await supabase
             .from('keys')
             .select('*')
@@ -368,21 +368,21 @@ app.post('/verify-key', async (req, res) => {
                 reason: 'Lỗi server'
             });
         }
-      
+     
         if (!row) {
             return res.json({
                 valid: false,
                 reason: 'Key không tồn tại'
             });
         }
-      
+     
         if (row.banned) {
             return res.json({
                 valid: false,
                 reason: 'Key đã bị khóa'
             });
         }
-      
+     
         const now = new Date();
         const expiresAt = new Date(row.expires_at);
         if (now > expiresAt && !row.permanent) {
@@ -391,7 +391,7 @@ app.post('/verify-key', async (req, res) => {
                 reason: 'Key đã hết hạn'
             });
         }
-      
+     
         if (row.used) {
             if (row.user_id !== user_id) {
                 return res.json({
@@ -408,10 +408,10 @@ app.post('/verify-key', async (req, res) => {
                 permanent: row.permanent
             });
         }
-      
+     
         await updateUserInfo(user_id, username);
         await logUserKeyActivity(user_id, key, 'verify', `Key verified by ${username}`);
-      
+     
         const { error: updateError } = await supabase
             .from('keys')
             .update({
@@ -423,7 +423,7 @@ app.post('/verify-key', async (req, res) => {
         if (updateError) {
             console.error('Lỗi khi cập nhật key:', updateError);
         }
-      
+     
         res.json({
             valid: true,
             user_id: user_id,
@@ -440,88 +440,187 @@ app.post('/verify-key', async (req, res) => {
         });
     }
 });
-// API lấy danh sách tất cả keys (async)
+// Hàm helper cho phân trang (có thể dùng chung)
+function getPaginationParams(req) {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    let per_page = parseInt(req.query.per_page) || 20;
+    // Nếu per_page = 0 hoặc -1, tải hết (không dùng range, lấy toàn bộ)
+    const loadAll = per_page <= 0;
+    per_page = loadAll ? 100000 : Math.min(100, per_page); // Giới hạn max 100 nếu không load all, tránh overload
+    const offset = loadAll ? 0 : (page - 1) * per_page;
+    return { page, per_page, offset, loadAll };
+}
+// API lấy danh sách tất cả keys (async) - Với phân trang
 app.get('/admin/keys', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
+    const { page, per_page, offset, loadAll } = getPaginationParams(req);
+    let query = supabase
         .from('keys')
-        .select('*')
+        .select('*', { count: 'exact' })
         .order('created_at', { ascending: false });
+    
+    if (!loadAll) {
+        query = query.range(offset, offset + per_page - 1);
+    }
+    
+    const { data: rows, error, count } = await query;
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
+ 
+    const total = count || 0;
+    const pages = loadAll ? 1 : Math.ceil(total / per_page);
+ 
+    res.json({
+        data: rows || [],
+        pagination: {
+            page,
+            per_page,
+            total,
+            pages,
+            load_all: loadAll
+        }
+    });
 });
-// API lấy danh sách tất cả users (async)
+// API lấy danh sách tất cả users (async) - Với phân trang
 app.get('/admin/users', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
+    const { page, per_page, offset, loadAll } = getPaginationParams(req);
+    let query = supabase
         .from('users')
-        .select('*')
+        .select('*', { count: 'exact' })
         .order('last_seen', { ascending: false });
+    
+    if (!loadAll) {
+        query = query.range(offset, offset + per_page - 1);
+    }
+    
+    const { data: rows, error, count } = await query;
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
+ 
+    const total = count || 0;
+    const pages = loadAll ? 1 : Math.ceil(total / per_page);
+ 
+    res.json({
+        data: rows || [],
+        pagination: {
+            page,
+            per_page,
+            total,
+            pages,
+            load_all: loadAll
+        }
+    });
 });
-// API lấy danh sách admin (async)
+// API lấy danh sách admin (async) - Với phân trang
 app.get('/admin/admins', authenticateRole(['super_admin', 'owner']), async (req, res) => {
-    const { data: rows, error } = await supabase
+    const { page, per_page, offset, loadAll } = getPaginationParams(req);
+    let query = supabase
         .from('admin')
-        .select('id, username, is_super_admin, is_owner, created_at')
+        .select('id, username, is_super_admin, is_owner, created_at', { count: 'exact' })
         .order('created_at', { ascending: false });
+    
+    if (!loadAll) {
+        query = query.range(offset, offset + per_page - 1);
+    }
+    
+    const { data: rows, error, count } = await query;
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
+ 
+    const total = count || 0;
+    const pages = loadAll ? 1 : Math.ceil(total / per_page);
+ 
+    res.json({
+        data: rows || [],
+        pagination: {
+            page,
+            per_page,
+            total,
+            pages,
+            load_all: loadAll
+        }
+    });
 });
-// API lấy lịch sử hoạt động admin (async)
+// API lấy lịch sử hoạt động admin (async) - Với phân trang (thay limit cũ bằng per_page)
 app.get('/admin/activity', authenticateRole(['owner']), async (req, res) => {
-    const limit = parseInt(req.query.limit) || 100;
-  
-    const { data: rows, error } = await supabase
+    const { page, per_page, offset, loadAll } = getPaginationParams(req);
+    let query = supabase
         .from('admin_activity')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(limit);
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false });
+    
+    if (!loadAll) {
+        query = query.range(offset, offset + per_page - 1);
+    }
+    
+    const { data: rows, error, count } = await query;
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
+ 
+    const total = count || 0;
+    const pages = loadAll ? 1 : Math.ceil(total / per_page);
+ 
+    res.json({
+        data: rows || [],
+        pagination: {
+            page,
+            per_page,
+            total,
+            pages,
+            load_all: loadAll
+        }
+    });
 });
-// API lấy lịch sử key của user (async)
+// API lấy lịch sử key của user (async) - Với phân trang (thay limit cũ bằng per_page)
 app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { user_id } = req.params;
-    const limit = parseInt(req.query.limit) || 50;
-  
-    const { data: rows, error } = await supabase
+    const { page, per_page, offset, loadAll } = getPaginationParams(req);
+    let query = supabase
         .from('user_key_history')
-        .select('*')
+        .select('*', { count: 'exact' })
         .eq('user_id', user_id)
-        .order('created_at', { ascending: false })
-        .limit(limit);
+        .order('created_at', { ascending: false });
+    
+    if (!loadAll) {
+        query = query.range(offset, offset + per_page - 1);
+    }
+    
+    const { data: rows, error, count } = await query;
     if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
-    res.json(rows || []);
+ 
+    const total = count || 0;
+    const pages = loadAll ? 1 : Math.ceil(total / per_page);
+ 
+    res.json({
+        data: rows || [],
+        pagination: {
+            page,
+            per_page,
+            total,
+            pages,
+            load_all: loadAll
+        }
+    });
 });
 // API ban user (async)
 app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { user_id } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (!user_id) {
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
-  
+ 
     const { error: keysError } = await supabase
         .from('keys')
         .update({ banned: true })
@@ -530,7 +629,7 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         console.error('Database error:', keysError);
         return res.status(500).json({ error: 'Lỗi database: ' + keysError.message });
     }
-  
+ 
     const { error: usersError } = await supabase
         .from('users')
         .update({ banned: true })
@@ -539,9 +638,9 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         console.error('Database error:', usersError);
         return res.status(500).json({ error: 'Lỗi database: ' + usersError.message });
     }
-  
+ 
     await logAdminActivity(admin_username, 'ban_user', 'user', user_id, `Banned user ${user_id}`);
-  
+ 
     // Lấy số changes (Supabase không có this.changes, dùng count)
     const { count: changes, error: countError } = await supabase
         .from('users')
@@ -551,7 +650,7 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
         console.error('Count error:', countError);
         changes = 1; // Fallback
     }
-  
+ 
     res.json({
         success: true,
         message: `Đã ban user ${user_id}`,
@@ -562,11 +661,11 @@ app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']),
 app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { user_id } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (!user_id) {
         return res.status(400).json({ error: 'Thiếu user_id' });
     }
-  
+ 
     const { error: keysError } = await supabase
         .from('keys')
         .update({ banned: false })
@@ -575,7 +674,7 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         console.error('Database error:', keysError);
         return res.status(500).json({ error: 'Lỗi database: ' + keysError.message });
     }
-  
+ 
     const { error: usersError } = await supabase
         .from('users')
         .update({ banned: false })
@@ -584,9 +683,9 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
         console.error('Database error:', usersError);
         return res.status(500).json({ error: 'Lỗi database: ' + usersError.message });
     }
-  
+ 
     await logAdminActivity(admin_username, 'unban_user', 'user', user_id, `Unbanned user ${user_id}`);
-  
+ 
     res.json({
         success: true,
         message: `Đã unban user ${user_id}`,
@@ -597,11 +696,11 @@ app.post('/admin/unban-user', authenticateRole(['admin', 'super_admin', 'owner']
 app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { key, hours, permanent } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (!key) {
         return res.status(400).json({ error: 'Thiếu key' });
     }
-  
+ 
     let updateData = {};
     if (permanent) {
         updateData = { permanent: true, expires_at: null };
@@ -622,9 +721,9 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
         if (!updatedRow) {
             return res.status(404).json({ error: 'Key không tồn tại' });
         }
-      
+     
         await logAdminActivity(admin_username, 'update_key', 'key', key, 'Set key to permanent');
-      
+     
         return res.json({
             success: true,
             message: `Đã đặt key ${key} thành vĩnh viễn`,
@@ -633,7 +732,7 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
     } else if (hours) {
         const newExpiry = new Date(Date.now() + hours * 60 * 60 * 1000);
         updateData = { expires_at: newExpiry.toISOString(), permanent: false };
-      
+     
         const { error } = await supabase
             .from('keys')
             .update(updateData)
@@ -650,9 +749,9 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
         if (!updatedRow) {
             return res.status(404).json({ error: 'Key không tồn tại' });
         }
-      
+     
         await logAdminActivity(admin_username, 'update_key', 'key', key, `Set key expiry to ${hours} hours`);
-      
+     
         res.json({
             success: true,
             message: `Đã cập nhật thời gian key ${key} thành ${hours} giờ`,
@@ -667,18 +766,18 @@ app.post('/admin/update-key-expiry', authenticateRole(['admin', 'super_admin', '
 app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { hours = 24, permanent = false, keyPrefix = 'key-' } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (typeof keyPrefix !== 'string' || keyPrefix.trim() === '') {
         return res.status(400).json({ error: 'keyPrefix phải là chuỗi không rỗng' });
     }
     const safePrefix = keyPrefix.trim();
     const newKey = generateRandomKey(5, safePrefix);
     let expiresAt = null;
-  
+ 
     if (!permanent) {
         expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
     }
-  
+ 
     const { data: insertedKey, error } = await supabase
         .from('keys')
         .insert({
@@ -692,9 +791,9 @@ app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi khi tạo key' });
     }
-  
+ 
     await logAdminActivity(admin_username, 'create_key', 'key', newKey, `Created ${permanent ? 'permanent' : hours + ' hours'} key`);
-  
+ 
     res.json({
         success: true,
         key: newKey,
@@ -707,7 +806,7 @@ app.post('/admin/create-key', authenticateRole(['admin', 'super_admin', 'owner']
 app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
     const { key } = req.params;
     const admin_username = req.user.username;
-  
+ 
     const { error, count } = await supabase
         .from('keys')
         .delete()
@@ -717,13 +816,13 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
+ 
     if (count === 0) {
         return res.status(404).json({ error: 'Key không tồn tại' });
     }
-  
+ 
     await logAdminActivity(admin_username, 'delete_key', 'key', key, 'Deleted key');
-  
+ 
     res.json({
         success: true,
         message: `Đã xóa key ${key}`
@@ -733,11 +832,11 @@ app.delete('/admin/delete-key/:key', authenticateRole(['admin', 'super_admin', '
 app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), async (req, res) => {
     const { username, password } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (!username || !password) {
         return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
-  
+ 
     const { data: existingAdmin, error: checkError } = await supabase
         .from('admin')
         .select('*')
@@ -747,11 +846,11 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
         console.error('Database error:', checkError);
         return res.status(500).json({ error: 'Lỗi database: ' + checkError.message });
     }
-  
+ 
     if (existingAdmin) {
         return res.status(400).json({ error: 'Admin đã tồn tại' });
     }
-  
+ 
     const hash = await bcrypt.hash(password, 10);
     const { error: insertError } = await supabase
         .from('admin')
@@ -763,9 +862,9 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
         console.error('Database error:', insertError);
         return res.status(500).json({ error: 'Lỗi khi tạo admin' });
     }
-  
+ 
     await logAdminActivity(admin_username, 'create_admin', 'admin', username, 'Created new admin');
-  
+ 
     res.json({
         success: true,
         message: `Đã tạo admin ${username} thành công`
@@ -775,11 +874,11 @@ app.post('/admin/create-admin', authenticateRole(['super_admin', 'owner']), asyn
 app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (req, res) => {
     const { username } = req.params;
     const admin_username = req.user.username;
-  
+ 
     if (username === 'owner') {
         return res.status(400).json({ error: 'Không thể xóa owner' });
     }
-  
+ 
     const { error, count } = await supabase
         .from('admin')
         .delete()
@@ -789,13 +888,13 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
+ 
     if (count === 0) {
         return res.status(404).json({ error: 'Admin không tồn tại' });
     }
-  
+ 
     await logAdminActivity(admin_username, 'delete_admin', 'admin', username, 'Deleted admin');
-  
+ 
     res.json({
         success: true,
         message: `Đã xóa admin ${username}`
@@ -805,15 +904,15 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (
 app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, res) => {
     const { username, is_super_admin } = req.body;
     const admin_username = req.user.username;
-  
+ 
     if (!username) {
         return res.status(400).json({ error: 'Thiếu username' });
     }
-  
+ 
     if (username === 'owner') {
         return res.status(400).json({ error: 'Không thể thay đổi quyền owner' });
     }
-  
+ 
     const { error, count } = await supabase
         .from('admin')
         .update({ is_super_admin })
@@ -823,15 +922,15 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, re
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
-  
+ 
     if (count === 0) {
         return res.status(404).json({ error: 'Admin không tồn tại' });
     }
-  
+ 
     const action = is_super_admin ? 'promote_admin' : 'demote_admin';
     await logAdminActivity(admin_username, action, 'admin', username,
                           `${is_super_admin ? 'Promoted to' : 'Demoted from'} super admin`);
-  
+ 
     res.json({
         success: true,
         message: `Đã ${is_super_admin ? 'thăng cấp' : 'hạ cấp'} admin ${username}`
@@ -840,7 +939,7 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, re
 // API kiểm tra key info (async)
 app.get('/key-info/:key', async (req, res) => {
     const { key } = req.params;
-  
+ 
     const { data: row, error } = await supabase
         .from('keys')
         .select('*')
@@ -851,18 +950,18 @@ app.get('/key-info/:key', async (req, res) => {
             error: 'Lỗi database: ' + error.message
         });
     }
-  
+ 
     if (!row) {
         return res.json({
             exists: false,
             message: 'Key không tồn tại'
         });
     }
-  
+ 
     const now = new Date();
     const expiresAt = row.expires_at ? new Date(row.expires_at) : null;
     const isExpired = expiresAt ? now > expiresAt : false;
-  
+ 
     res.json({
         exists: true,
         key: row.key,
@@ -881,14 +980,14 @@ app.get('/key-info/:key', async (req, res) => {
 app.post('/check-time-left', async (req, res) => {
     try {
         const { hwid } = req.body;
-      
+     
         if (!hwid) {
             return res.status(400).json({
                 success: false,
                 message: 'Thiếu HWID'
             });
         }
-      
+     
         const { data: row, error: selectError } = await supabase
             .from('requests')
             .select('*')
@@ -901,7 +1000,7 @@ app.post('/check-time-left', async (req, res) => {
                 message: 'Lỗi server'
             });
         }
-      
+     
         if (!row) {
             return res.json({
                 can_request: true,
@@ -909,12 +1008,12 @@ app.post('/check-time-left', async (req, res) => {
                 message: 'Bạn có thể lấy key ngay bây giờ'
             });
         }
-      
+     
         const lastRequestTime = new Date(row.last_request_time);
         const now = new Date();
         const timeDiff = now - lastRequestTime;
         const hoursDiff = timeDiff / (1000 * 60 * 60);
-      
+     
         if (hoursDiff >= 1) {
             return res.json({
                 can_request: true,
@@ -925,7 +1024,7 @@ app.post('/check-time-left', async (req, res) => {
             const timeLeft = 1 - hoursDiff;
             const hoursLeft = Math.floor(timeLeft);
             const minutesLeft = Math.floor((timeLeft - hoursLeft) * 60);
-          
+         
             return res.json({
                 can_request: false,
                 time_left: timeLeft,
@@ -953,11 +1052,11 @@ app.get('/health', (req, res) => {
 // Admin login endpoint (async, với bypass cho owner)
 app.post('/admin/login', async (req, res) => {
     const { username, password } = req.body;
-  
+ 
     if (!username || !password) {
         return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
-  
+ 
     if (username === 'owner') {
         // Bypass database cho owner: Hardcode check password
         if (password === 'tungdeptrai1202') {
@@ -966,7 +1065,7 @@ app.post('/admin/login', async (req, res) => {
                 is_super_admin: true, // Owner luôn có quyền super_admin
                 is_owner: true
             }, SECRET, { expiresIn: '1d' });
-      
+     
             return res.json({
                 success: true,
                 token,
@@ -988,20 +1087,20 @@ app.post('/admin/login', async (req, res) => {
             console.error('Database error:', error);
             return res.status(500).json({ error: 'Lỗi server' });
         }
-  
+ 
         if (!row) {
             return res.status(401).json({ error: 'Sai thông tin đăng nhập' });
         }
-  
+ 
         const result = await bcrypt.compare(password, row.password);
-  
+ 
         if (result) {
             const token = jwt.sign({
                 username: row.username,
                 is_super_admin: row.is_super_admin,
                 is_owner: row.is_owner
             }, SECRET, { expiresIn: '1d' });
-      
+     
             res.json({
                 success: true,
                 token,
