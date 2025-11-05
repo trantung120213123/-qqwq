@@ -31,9 +31,9 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
-// Khởi tạo database: Chỉ thêm owner mặc định nếu chưa có (bảng đã tồn tại)
+// Khởi tạo database: Tạo bảng nếu chưa có (Supabase tự handle schema, nhưng có thể dùng RPC hoặc migration tool; ở đây giả sử schema đã tạo từ SQL trước)
 async function initializeSupabase() {
-    console.log('✅ Supabase client đã sẵn sàng. Bảng đã được tạo sẵn.');
+    console.log('✅ Supabase client đã sẵn sàng. Giả sử schema đã được tạo từ SQL script trước đó.');
     
     // Thêm owner mặc định nếu chưa có
     const ownerPassword = 'tungdeptrai1202';
@@ -440,93 +440,78 @@ app.post('/verify-key', async (req, res) => {
         });
     }
 });
-// Helper function for pagination
-async function getPaginatedData(table, selectFields = '*', orderBy = null, filters = {}, page = 1, limit = 10) {
-    const start = (page - 1) * limit;
-    const end = start + limit - 1;
-
-    // Build query for data
-    let query = supabase.from(table).select(selectFields, { count: 'exact' });
-    if (orderBy) {
-        query = query.order(orderBy.field, { ascending: orderBy.ascending !== false });
-    }
-    for (const [key, value] of Object.entries(filters)) {
-        query = query.eq(key, value);
-    }
-    const { data, error, count } = await query.range(start, end);
-
-    if (error) {
-        throw error;
-    }
-
-    return {
-        data: data || [],
-        total: count || 0,
-        page,
-        limit,
-        total_pages: Math.ceil((count || 0) / limit)
-    };
-}
-// API lấy danh sách tất cả keys (async) với phân trang
+// API lấy danh sách tất cả keys (async)
 app.get('/admin/keys', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 10;
-        const result = await getPaginatedData('keys', '*', { field: 'created_at', ascending: false }, {}, page, limit);
-        res.json(result);
-    } catch (error) {
+    const { data: rows, error } = await supabase
+        .from('keys')
+        .select('*')
+        .order('created_at', { ascending: false });
+    if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
+  
+    res.json(rows || []);
 });
-// API lấy danh sách tất cả users (async) với phân trang
+// API lấy danh sách tất cả users (async)
 app.get('/admin/users', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 10;
-        const result = await getPaginatedData('users', '*', { field: 'last_seen', ascending: false }, {}, page, limit);
-        res.json(result);
-    } catch (error) {
+    const { data: rows, error } = await supabase
+        .from('users')
+        .select('*')
+        .order('last_seen', { ascending: false });
+    if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
+  
+    res.json(rows || []);
 });
-// API lấy danh sách admin (async) với phân trang
+// API lấy danh sách admin (async)
 app.get('/admin/admins', authenticateRole(['super_admin', 'owner']), async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 10;
-        const result = await getPaginatedData('admin', 'id, username, is_super_admin, is_owner, created_at', { field: 'created_at', ascending: false }, {}, page, limit);
-        res.json(result);
-    } catch (error) {
+    const { data: rows, error } = await supabase
+        .from('admin')
+        .select('id, username, is_super_admin, is_owner, created_at')
+        .order('created_at', { ascending: false });
+    if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
+  
+    res.json(rows || []);
 });
-// API lấy lịch sử hoạt động admin (async) với phân trang
+// API lấy lịch sử hoạt động admin (async)
 app.get('/admin/activity', authenticateRole(['owner']), async (req, res) => {
-    try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 100;
-        const result = await getPaginatedData('admin_activity', '*', { field: 'created_at', ascending: false }, {}, page, limit);
-        res.json(result);
-    } catch (error) {
+    const limit = parseInt(req.query.limit) || 100;
+  
+    const { data: rows, error } = await supabase
+        .from('admin_activity')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(limit);
+    if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
+  
+    res.json(rows || []);
 });
-// API lấy lịch sử key của user (async) với phân trang
+// API lấy lịch sử key của user (async)
 app.get('/admin/user-key-history/:user_id', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
-    try {
-        const { user_id } = req.params;
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 50;
-        const result = await getPaginatedData('user_key_history', '*', { field: 'created_at', ascending: false }, { user_id }, page, limit);
-        res.json(result);
-    } catch (error) {
+    const { user_id } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+  
+    const { data: rows, error } = await supabase
+        .from('user_key_history')
+        .select('*')
+        .eq('user_id', user_id)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+    if (error) {
         console.error('Database error:', error);
         return res.status(500).json({ error: 'Lỗi database: ' + error.message });
     }
+  
+    res.json(rows || []);
 });
 // API ban user (async)
 app.post('/admin/ban-user', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
