@@ -97,14 +97,15 @@ async function logUserKeyActivity(userId, key, action, details = null) {
     }
 }
 // Hàm tạo key ngẫu nhiên
-function generateRandomKey(length = 5, prefix = 'key-') {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let result = '';
+function generateRandomKey(length = 18, prefix = '') {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'; // chữ thường + số
+    let key = '';
     for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
+        key += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    return `${prefix}${result}`;
+    return prefix + key;
 }
+
 // Hàm cập nhật thông tin user (async)
 async function updateUserInfo(user_id, username) {
     if (!user_id) return;
