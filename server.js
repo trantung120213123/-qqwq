@@ -304,7 +304,7 @@ app.post('/get-key', async (req, res) => {
             }
         }
       
-        const newKey = generateRandomKey(5);
+        const newKey = generateRandomKey(18);
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
       
         const { data: insertedKey, error: insertKeyError } = await supabase
