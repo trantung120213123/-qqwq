@@ -61,6 +61,26 @@ const privateChatRooms = new Map();
 const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const pendingPrivateInvites = new Map();
 const PRIVATE_INVITE_TTL_MS = 2 * 60 * 1000;
+const WARNING_LIMIT = 3;
+const RATE_LIMIT_MIN_INTERVAL_MS = 1000;
+const RATE_LIMIT_BURST_WINDOW_MS = 3000;
+const RATE_LIMIT_BURST_COUNT = 5;
+const RATE_LIMIT_BURST_MUTE_MS = 30 * 1000;
+const PRIVATE_CHAT_COOLDOWN_MS = 1500;
+const MAX_CHAT_TEXT_LENGTH = 150;
+const STRIKE_DECAY_MS = 14 * 24 * 60 * 60 * 1000;
+const chatRateStateByUser = new Map();
+const MASKED_MESSAGE_TEXT = '############';
+const adminMuteCache = new Map();
+const userMutePairCache = new Map();
+const modRoleCache = new Map();
+const MOD_ROLE_CACHE_TTL_MS = 60 * 1000;
+const MUTE_STEPS_MS = [
+    24 * 60 * 60 * 1000, // 1 day
+    3 * 24 * 60 * 60 * 1000, // 3 days
+    7 * 24 * 60 * 60 * 1000, // 1 week
+    30 * 24 * 60 * 60 * 1000 // 1 month
+];
 
 function nowMs() {
     return Date.now();
@@ -296,25 +316,46 @@ function chatClientKey(serverId, playerName) {
     return `${serverId}:${playerName}`;
 }
 
-const BLOCKED_CHAT_PHRASES = [
-    // Explicit sexual profanity
-    '\u0111\u1ecbt',
-    'dit',
+const BLOCKED_CHAT_PATTERNS = [
+    // Severe profanity / harassment
+    { label: 'abuse', regex: /\bđ[ịi]t\b/giu },
+    { label: 'abuse', regex: /\bdit\b/giu },
+    { label: 'abuse', regex: /\bc[ạa]c\b/giu },
+    { label: 'abuse', regex: /\bfuck\b/giu },
+    // User-targeted harassment phrase requested
+    { label: 'abuse', regex: /\bdavid[\s._-]*backzuki\b/giu },
     // Gore / excessive violence
-    'ch\u1eb7t \u0111\u1ea7u',
-    'chat dau',
-    '\u0111\u1ee9t \u0111\u1ea7u',
-    'dut dau',
-    'c\u1eaft c\u1ed5',
-    'cat co',
-    'm\u00f3c m\u1eaft',
-    'moc mat',
-    'moi ru\u1ed9t',
-    'moi ruot',
-    'x\u1ebb x\u00e1c',
-    'xe xac',
-    'phanh th\u00e2y',
-    'phanh thay',
+    { label: 'gore', regex: /\bch[ặa]t[\s._-]*đ[ầa]u\b/giu },
+    { label: 'gore', regex: /\bchat[\s._-]*dau\b/giu },
+    { label: 'gore', regex: /\bđ[ứu]t[\s._-]*đ[ầa]u\b/giu },
+    { label: 'gore', regex: /\bdut[\s._-]*dau\b/giu },
+    { label: 'gore', regex: /\bc[ắa]t[\s._-]*c[ổo]\b/giu },
+    { label: 'gore', regex: /\bcat[\s._-]*co\b/giu },
+    { label: 'gore', regex: /\bm[óo]c[\s._-]*m[ắa]t\b/giu },
+    { label: 'gore', regex: /\bmoc[\s._-]*mat\b/giu },
+    { label: 'gore', regex: /\bm[óo]i[\s._-]*ru[ộo]t\b/giu },
+    { label: 'gore', regex: /\bmoi[\s._-]*ruot\b/giu },
+    { label: 'gore', regex: /\bx[ẻe][\s._-]*x[áa]c\b/giu },
+    { label: 'gore', regex: /\bxe[\s._-]*xac\b/giu },
+    { label: 'gore', regex: /\bphanh[\s._-]*th[âa]y\b/giu },
+    { label: 'gore', regex: /\bbehead\b/giu },
+    { label: 'gore', regex: /\bdecapitate\b/giu },
+    { label: 'gore', regex: /\bdismember\b/giu }
+];
+
+const BLOCKED_CANONICAL_TERMS = [
+    'fuck',
+    'dit',
+    'ditme',
+    'cac',
+    'davidbackzuki',
+    'chatdau',
+    'dutdau',
+    'catco',
+    'mocmat',
+    'moiruot',
+    'xexac',
+    'phanhthay',
     'behead',
     'decapitate',
     'dismember'
@@ -322,20 +363,1048 @@ const BLOCKED_CHAT_PHRASES = [
 
 function sanitizeChatText(text) {
     if (typeof text !== 'string') return '';
-    return text.replace(/\s+/g, ' ').trim().slice(0, 240);
+    return text.replace(/\s+/g, ' ').trim().slice(0, MAX_CHAT_TEXT_LENGTH);
 }
 
-function escapeRegex(text) {
-    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function cloneRegexWithGlobal(re) {
+    const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
+    return new RegExp(re.source, flags);
+}
+
+function normalizePolicyText(text) {
+    return String(text || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+}
+
+function normalizeForPhraseDetection(text) {
+    return normalizePolicyText(text)
+        .replace(/[!|1]/g, 'i')
+        .replace(/3/g, 'e')
+        .replace(/4|@/g, 'a')
+        .replace(/5|\$/g, 's')
+        .replace(/0/g, 'o')
+        .replace(/7|\+/g, 't')
+        .replace(/[^a-z0-9]/g, '');
 }
 
 function censorBlockedChatText(text) {
     let output = String(text || '');
-    for (const phrase of BLOCKED_CHAT_PHRASES) {
-        const re = new RegExp(escapeRegex(phrase), 'giu');
-        output = output.replace(re, (match) => '#'.repeat(match.length));
+    for (const rule of BLOCKED_CHAT_PATTERNS) {
+        const regex = cloneRegexWithGlobal(rule.regex);
+        output = output.replace(regex, '##');
     }
     return output;
+}
+
+function hasBlockedLink(text) {
+    const normalized = normalizePolicyText(text);
+    const noSpaces = normalized.replace(/\s+/g, '');
+    if (/https?:\/\//.test(noSpaces) || /www\./.test(noSpaces) || /discord\.gg/.test(noSpaces)) {
+        return true;
+    }
+    const flattened = normalizeForPhraseDetection(normalized);
+    if (flattened.includes('discordgg') || flattened.includes('http') || flattened.includes('https') || flattened.includes('www')) {
+        return true;
+    }
+    return /[a-z0-9]{2,}(com|io|sx|h)\b/.test(flattened);
+}
+
+function censorBlockedLinks(text) {
+    const regex = /(https?:\/\/\S+|www\.\S+|[a-z0-9][a-z0-9\-\/\\\.]{1,90}\.(?:com|io|sx|h)\S*)/giu;
+    return String(text || '').replace(regex, '##');
+}
+
+function applyContentPolicy(text) {
+    let output = String(text || '');
+    const reasons = new Set();
+    let matched = false;
+
+    for (const rule of BLOCKED_CHAT_PATTERNS) {
+        const regex = cloneRegexWithGlobal(rule.regex);
+        if (regex.test(output)) {
+            matched = true;
+            reasons.add(rule.label);
+            output = output.replace(regex, '##');
+        }
+    }
+
+    const normalizedCompact = normalizeForPhraseDetection(output);
+    for (const term of BLOCKED_CANONICAL_TERMS) {
+        if (normalizedCompact.includes(term)) {
+            matched = true;
+            reasons.add('abuse');
+            output = '##';
+            break;
+        }
+    }
+
+    if (hasBlockedLink(output)) {
+        matched = true;
+        reasons.add('link');
+        output = censorBlockedLinks(output);
+    }
+
+    output = output.trim();
+    if (!output) {
+        output = '##';
+    }
+
+    return {
+        text: output,
+        violated: matched,
+        reasons: Array.from(reasons)
+    };
+}
+
+function policyUserKey(userId, playerName) {
+    const numeric = Number(userId || 0) || 0;
+    if (numeric > 0) return `uid:${numeric}`;
+    const name = String(playerName || '').trim().toLowerCase();
+    return `name:${name}`;
+}
+
+function policyUserKeys(userId, playerName) {
+    const keys = [];
+    const numeric = Number(userId || 0) || 0;
+    const name = String(playerName || '').trim().toLowerCase();
+    if (numeric > 0) keys.push(`uid:${numeric}`);
+    if (name) keys.push(`name:${name}`);
+    return Array.from(new Set(keys));
+}
+
+function buildSenderMeta({ serverId, placeId, playerName, displayName, userId }) {
+    return {
+        serverId: String(serverId || '').trim(),
+        placeId: Number(placeId || 0) || 0,
+        playerName: String(playerName || '').trim(),
+        displayName: String(displayName || '').trim() || String(playerName || '').trim(),
+        userId: Number(userId || 0) || 0
+    };
+}
+
+function usernameLower(name) {
+    return String(name || '').trim().toLowerCase();
+}
+
+function parseDurationHms(input) {
+    const raw = String(input || '').trim();
+    const m = raw.match(/^(\d{1,3}):([0-5]\d):([0-5]\d)$/);
+    if (!m) return null;
+    const hours = Number(m[1]);
+    const mins = Number(m[2]);
+    const secs = Number(m[3]);
+    const total = (hours * 3600) + (mins * 60) + secs;
+    if (!Number.isFinite(total) || total <= 0) return null;
+    return total * 1000;
+}
+
+function parseDurationShort(input) {
+    const raw = String(input || '').trim().toLowerCase();
+    const m = raw.match(/^(\d+)([smhd])$/);
+    if (!m) return null;
+    const value = Number(m[1]);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const unit = m[2];
+    let scale = 24 * 60 * 60 * 1000;
+    if (unit === 's') scale = 1000;
+    else if (unit === 'm') scale = 60 * 1000;
+    else if (unit === 'h') scale = 60 * 60 * 1000;
+    return value * scale;
+}
+
+async function getChatRole(username) {
+    const uname = usernameLower(username);
+    if (!uname) return 'user';
+
+    const now = Date.now();
+    const cached = modRoleCache.get(uname);
+    if (cached && cached.expiresAt > now) {
+        return cached.role;
+    }
+
+    const { data, error } = await supabase
+        .from('staff_roles')
+        .select('role')
+        .eq('username_lower', uname)
+        .limit(1)
+        .maybeSingle();
+    if (error) return 'user';
+    const role = (data?.role === 'admin' || data?.role === 'mod') ? data.role : 'user';
+    modRoleCache.set(uname, { role, expiresAt: now + MOD_ROLE_CACHE_TTL_MS });
+    return role;
+}
+
+function invalidateModRoleCache(username) {
+    modRoleCache.delete(usernameLower(username));
+}
+
+function staffCanModerateTarget(senderRole, targetRole) {
+    if (senderRole === 'admin') {
+        return targetRole !== 'admin';
+    }
+    if (senderRole === 'mod') {
+        return targetRole === 'user';
+    }
+    return false;
+}
+
+async function logStaffAction({ actorMeta, actorRole, action, targetMeta = null, detail = null }) {
+    try {
+        await supabase
+            .from('staff_action_logs')
+            .insert({
+                actor_user_key: policyUserKey(actorMeta?.userId, actorMeta?.playerName),
+                actor_username: actorMeta?.playerName || null,
+                actor_username_lower: usernameLower(actorMeta?.playerName),
+                actor_role: actorRole || 'user',
+                action: action,
+                target_user_key: targetMeta ? policyUserKey(targetMeta.userId, targetMeta.playerName) : null,
+                target_username: targetMeta?.playerName || null,
+                target_username_lower: usernameLower(targetMeta?.playerName),
+                detail: detail || null
+            });
+    } catch (_) {}
+}
+
+function userMutePairKey(serverId, muterName, targetName) {
+    return `${String(serverId || '').trim()}::${usernameLower(muterName)}->${usernameLower(targetName)}`;
+}
+
+function cleanupMuteCaches() {
+    const now = Date.now();
+    for (const [key, until] of adminMuteCache.entries()) {
+        if (!until || until <= now) adminMuteCache.delete(key);
+    }
+    for (const [key, until] of userMutePairCache.entries()) {
+        if (!until || until <= now) userMutePairCache.delete(key);
+    }
+}
+
+async function logChatMessageAudit(payload) {
+    try {
+        await supabase.from('message_logs').insert({
+            server_id: payload.serverId || null,
+            channel: payload.channel || null,
+            room_id: payload.roomId || null,
+            player_name: payload.playerName || 'unknown',
+            display_name: payload.displayName || null,
+            user_id: payload.userId || null,
+            text_sanitized: payload.textSanitized || '',
+            text_original: payload.textOriginal || null,
+            moderation_reasons: payload.reasons || null,
+            is_masked: !!payload.isMasked
+        });
+    } catch (_) {}
+}
+
+async function getBanState(meta) {
+    const key = policyUserKey(meta.userId, meta.playerName);
+    const uname = usernameLower(meta.playerName);
+    const nowIso = new Date().toISOString();
+
+    let { data, error } = await supabase
+        .from('ban_list')
+        .select('*')
+        .eq('user_key', key)
+        .limit(1)
+        .maybeSingle();
+    if (error) throw error;
+    if (!data) {
+        ({ data, error } = await supabase
+            .from('ban_list')
+            .select('*')
+            .eq('username_lower', uname)
+            .limit(1)
+            .maybeSingle());
+        if (error) throw error;
+    }
+    if (!data) return null;
+
+    if (data.is_permanent) return data;
+    if (!data.banned_until) return null;
+    if (new Date(data.banned_until).toISOString() <= nowIso) return null;
+    return data;
+}
+
+async function getAdminMuteState(meta) {
+    cleanupMuteCaches();
+    const key = policyUserKey(meta.userId, meta.playerName);
+    if (adminMuteCache.has(key)) {
+        const untilMs = adminMuteCache.get(key);
+        return new Date(untilMs);
+    }
+
+    const uname = usernameLower(meta.playerName);
+    const nowIso = new Date().toISOString();
+    let { data, error } = await supabase
+        .from('mute_list')
+        .select('*')
+        .eq('user_key', key)
+        .gt('muted_until', nowIso)
+        .limit(1)
+        .maybeSingle();
+    if (error) throw error;
+    if (!data) {
+        ({ data, error } = await supabase
+            .from('mute_list')
+            .select('*')
+            .eq('username_lower', uname)
+            .gt('muted_until', nowIso)
+            .limit(1)
+            .maybeSingle());
+        if (error) throw error;
+    }
+    if (!data) return null;
+    const untilMs = new Date(data.muted_until).getTime();
+    if (Number.isFinite(untilMs)) adminMuteCache.set(key, untilMs);
+    return new Date(untilMs);
+}
+
+async function upsertAdminMute(targetMeta, mutedBy, durationMs, reason = null) {
+    const until = new Date(Date.now() + durationMs).toISOString();
+    const payload = {
+        user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+        username: targetMeta.playerName,
+        username_lower: usernameLower(targetMeta.playerName),
+        user_id: targetMeta.userId || null,
+        muted_by: mutedBy,
+        reason: reason || null,
+        muted_until: until
+    };
+    const { error } = await supabase
+        .from('mute_list')
+        .upsert(payload, { onConflict: 'user_key' });
+    if (error) throw error;
+    adminMuteCache.set(payload.user_key, new Date(until).getTime());
+    return until;
+}
+
+async function removeAdminMute(targetName) {
+    const uname = usernameLower(targetName);
+    const { data, error } = await supabase
+        .from('mute_list')
+        .delete()
+        .eq('username_lower', uname)
+        .select('user_key');
+    if (error) throw error;
+    for (const row of (data || [])) {
+        if (row.user_key) adminMuteCache.delete(row.user_key);
+    }
+}
+
+async function getActiveAdminMuteByName(targetName) {
+    const uname = usernameLower(targetName);
+    if (!uname) return null;
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+        .from('mute_list')
+        .select('*')
+        .eq('username_lower', uname)
+        .gt('muted_until', nowIso)
+        .limit(1)
+        .maybeSingle();
+    if (error) return null;
+    return data || null;
+}
+
+async function upsertUserMutePair(serverId, muterMeta, targetMeta, durationMs) {
+    const until = new Date(Date.now() + durationMs).toISOString();
+    const payload = {
+        server_id: serverId,
+        muter_key: policyUserKey(muterMeta.userId, muterMeta.playerName),
+        muter_name: muterMeta.playerName,
+        muter_name_lower: usernameLower(muterMeta.playerName),
+        target_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+        target_name: targetMeta.playerName,
+        target_name_lower: usernameLower(targetMeta.playerName),
+        muted_until: until
+    };
+    const { error } = await supabase
+        .from('user_mute_pairs')
+        .upsert(payload, { onConflict: 'server_id,muter_key,target_key' });
+    if (error) throw error;
+    userMutePairCache.set(userMutePairKey(serverId, muterMeta.playerName, targetMeta.playerName), new Date(until).getTime());
+    return until;
+}
+
+async function removeUserMutePair(serverId, muterMeta, targetName) {
+    const muterKey = policyUserKey(muterMeta.userId, muterMeta.playerName);
+    const targetLower = usernameLower(targetName);
+    const { data, error } = await supabase
+        .from('user_mute_pairs')
+        .delete()
+        .eq('server_id', serverId)
+        .eq('muter_key', muterKey)
+        .eq('target_name_lower', targetLower)
+        .select('target_name');
+    if (error) throw error;
+    for (const row of (data || [])) {
+        userMutePairCache.delete(userMutePairKey(serverId, muterMeta.playerName, row.target_name || targetName));
+    }
+}
+
+async function hasUserMutedTarget(serverId, viewerMeta, senderMeta) {
+    cleanupMuteCaches();
+    const key = userMutePairKey(serverId, viewerMeta.playerName, senderMeta.playerName);
+    if (userMutePairCache.has(key)) return true;
+
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+        .from('user_mute_pairs')
+        .select('muted_until')
+        .eq('server_id', serverId)
+        .eq('muter_name_lower', usernameLower(viewerMeta.playerName))
+        .eq('target_name_lower', usernameLower(senderMeta.playerName))
+        .gt('muted_until', nowIso)
+        .limit(1);
+    if (error) return false;
+    if (!Array.isArray(data) || data.length === 0) return false;
+    const untilMs = new Date(data[0].muted_until).getTime();
+    if (Number.isFinite(untilMs)) userMutePairCache.set(key, untilMs);
+    return true;
+}
+
+function findOnlineMeta(serverId, username) {
+    const uname = usernameLower(username);
+    const targetServer = String(serverId || '').trim();
+    for (const client of chatClients) {
+        if (!client || !client.meta) continue;
+        if (targetServer && client.meta.serverId !== targetServer) continue;
+        if (usernameLower(client.meta.playerName) === uname) {
+            return {
+                playerName: client.meta.playerName,
+                userId: client.meta.userId || 0
+            };
+        }
+    }
+    return null;
+}
+
+async function executeSlashCommand(ws, text, context = {}) {
+    const raw = String(text || '').trim();
+    if (!raw.startsWith('/')) return { handled: false };
+
+    const parts = raw.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const sender = ws.meta;
+    const role = await getChatRole(sender.playerName);
+    const isAdmin = role === 'admin';
+    const isModOrAdmin = role === 'admin' || role === 'mod';
+
+    const requireModOrAdmin = () => {
+        if (isModOrAdmin) return true;
+        sendChatWs(ws, { type: 'error', message: 'forbidden command (admin/mod only)' });
+        return false;
+    };
+
+    const requireAdmin = () => {
+        if (isAdmin) return true;
+        sendChatWs(ws, { type: 'error', message: 'forbidden command (admin only)' });
+        return false;
+    };
+
+    if (cmd === '/addmod') {
+        if (!requireAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        if (!targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /addmod username' });
+            return { handled: true };
+        }
+        const targetRole = await getChatRole(targetName);
+        if (targetRole === 'admin') {
+            sendChatWs(ws, { type: 'error', message: `${targetName} is admin` });
+            return { handled: true };
+        }
+        const payload = {
+            user_key: policyUserKey(0, targetName),
+            username: targetName,
+            username_lower: usernameLower(targetName),
+            role: 'mod',
+            added_by: sender.playerName
+        };
+        const { error } = await supabase
+            .from('staff_roles')
+            .upsert(payload, { onConflict: 'username_lower' });
+        if (error) {
+            sendChatWs(ws, { type: 'error', message: 'add mod failed' });
+            return { handled: true };
+        }
+        invalidateModRoleCache(targetName);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: 'addmod',
+            targetMeta: { playerName: targetName, userId: 0 },
+            detail: { command: raw }
+        });
+        sendChatWs(ws, { type: 'command_result', message: `Added mod: ${targetName}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/unmod') {
+        if (!requireAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        if (!targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /unmod username' });
+            return { handled: true };
+        }
+        const targetRole = await getChatRole(targetName);
+        if (targetRole !== 'mod') {
+            sendChatWs(ws, { type: 'error', message: `${targetName} is not mod` });
+            return { handled: true };
+        }
+        const { error } = await supabase
+            .from('staff_roles')
+            .delete()
+            .eq('username_lower', usernameLower(targetName))
+            .eq('role', 'mod');
+        if (error) {
+            sendChatWs(ws, { type: 'error', message: 'unmod failed' });
+            return { handled: true };
+        }
+        invalidateModRoleCache(targetName);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: 'unmod',
+            targetMeta: { playerName: targetName, userId: 0 },
+            detail: { command: raw }
+        });
+        sendChatWs(ws, { type: 'command_result', message: `Removed mod: ${targetName}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/listmod') {
+        if (!requireAdmin()) return { handled: true };
+        const { data, error } = await supabase
+            .from('staff_roles')
+            .select('username')
+            .eq('role', 'mod')
+            .order('username', { ascending: true })
+            .limit(200);
+        if (error) {
+            sendChatWs(ws, { type: 'error', message: 'list mod failed' });
+            return { handled: true };
+        }
+        const names = (data || []).map((r) => r.username).filter(Boolean);
+        sendChatWs(ws, {
+            type: 'command_result',
+            message: names.length > 0 ? `Mods: ${names.join(', ')}` : 'No mod found'
+        });
+        return { handled: true };
+    }
+
+    if (cmd === '/history') {
+        if (!requireAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        if (!targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /history username' });
+            return { handled: true };
+        }
+        const userKeyByName = policyUserKey(0, targetName);
+        let modState = null;
+        let activeMute = null;
+        let actions = [];
+
+        try {
+            ({ data: modState } = await supabase
+                .from('chat_moderation_state')
+                .select('*')
+                .eq('user_key', userKeyByName)
+                .limit(1)
+                .maybeSingle());
+            ({ data: activeMute } = await supabase
+                .from('mute_list')
+                .select('*')
+                .eq('username_lower', usernameLower(targetName))
+                .limit(1)
+                .maybeSingle());
+            const { data } = await supabase
+                .from('staff_action_logs')
+                .select('created_at,actor_username,action,detail')
+                .eq('target_username_lower', usernameLower(targetName))
+                .order('created_at', { ascending: false })
+                .limit(10);
+            actions = data || [];
+        } catch (_) {}
+
+        const lines = [];
+        lines.push(`History ${targetName}`);
+        if (modState) {
+            lines.push(`warnings=${Number(modState.warning_count || 0)} strike=${Number(modState.strike_level || 0)} violations=${Number(modState.total_violations || 0)}`);
+        }
+        if (activeMute && activeMute.muted_until) {
+            lines.push(`activeMute=${activeMute.muted_until} by=${activeMute.muted_by || 'unknown'}`);
+        }
+        if (actions.length > 0) {
+            lines.push(`recentActions=${actions.length}`);
+        }
+        sendChatWs(ws, { type: 'command_result', message: lines.join(' | ') });
+        return { handled: true };
+    }
+
+    if (cmd === '/mute' || cmd === '/tempmute') {
+        if (!requireModOrAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        const durationRaw = String(parts[2] || '').trim().toLowerCase();
+        const durationMs = parseDurationShort(durationRaw);
+        if (!targetName || !durationMs) {
+            sendChatWs(ws, { type: 'error', message: `Usage: ${cmd} username [1d|3d|7d]` });
+            return { handled: true };
+        }
+        if (usernameLower(targetName) === usernameLower(sender.playerName)) {
+            sendChatWs(ws, { type: 'error', message: 'cannot mute yourself' });
+            return { handled: true };
+        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName);
+        if (!targetMeta) {
+            sendChatWs(ws, { type: 'error', message: 'target must be online' });
+            return { handled: true };
+        }
+        const targetRole = await getChatRole(targetMeta.playerName);
+        if (!staffCanModerateTarget(role, targetRole)) {
+            sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
+            return { handled: true };
+        }
+        if (!isAdmin) {
+            const maxMs = cmd === '/tempmute'
+                ? 24 * 60 * 60 * 1000
+                : 7 * 24 * 60 * 60 * 1000;
+            if (durationMs > maxMs) {
+                const ruleText = cmd === '/tempmute' ? 'max 1d' : 'max 7d';
+                sendChatWs(ws, { type: 'error', message: `mod ${ruleText}` });
+                return { handled: true };
+            }
+        }
+        const muteUntil = await upsertAdminMute(targetMeta, sender.playerName, durationMs, `manual ${role} mute`);
+        await applyManualMuteToModerationState(targetMeta, muteUntil);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: cmd === '/tempmute' ? 'tempmute' : 'mute',
+            targetMeta,
+            detail: { duration: durationRaw, command: raw }
+        });
+        await broadcastSystemMessage(sender.serverId, `[MOD] ${sender.playerName} muted ${targetMeta.playerName} (${durationRaw})`);
+        const targetSocket = chatSocketOf(sender.serverId, targetMeta.playerName);
+        if (targetSocket) {
+            sendChatWs(targetSocket, {
+                type: 'moderation_muted',
+                message: `Bạn đã bị mute bởi ${sender.playerName} trong ${durationRaw}.`,
+                strikeLevel: 0
+            });
+        }
+        sendChatWs(ws, {
+            type: 'command_result',
+            message: `${cmd === '/tempmute' ? 'Tempmuted' : 'Muted'} ${targetMeta.playerName} for ${durationRaw}`
+        });
+        return { handled: true };
+    }
+
+    if (cmd === '/unsmute' || cmd === '/unmute') {
+        if (!requireModOrAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        if (!targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /unsmute username' });
+            return { handled: true };
+        }
+        const targetRole = await getChatRole(targetName);
+        if (!staffCanModerateTarget(role, targetRole)) {
+            sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
+            return { handled: true };
+        }
+        if (!isAdmin) {
+            const activeMute = await getActiveAdminMuteByName(targetName);
+            if (!activeMute) {
+                sendChatWs(ws, { type: 'error', message: `${targetName} is not muted` });
+                return { handled: true };
+            }
+            if (usernameLower(activeMute.muted_by) !== usernameLower(sender.playerName)) {
+                sendChatWs(ws, { type: 'error', message: 'mod can only unsmute users muted by yourself' });
+                return { handled: true };
+            }
+        }
+        await removeAdminMute(targetName);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: 'unsmute',
+            targetMeta: { playerName: targetName, userId: 0 },
+            detail: { command: raw }
+        });
+        await broadcastSystemMessage(sender.serverId, `[MOD] ${sender.playerName} unsmuted ${targetName}`);
+        sendChatWs(ws, {
+            type: 'command_result',
+            message: `Unsmuted ${targetName}`
+        });
+        return { handled: true };
+    }
+
+    if (cmd === '/warn') {
+        if (!requireModOrAdmin()) return { handled: true };
+        const targetName = String(parts[1] || '').trim();
+        if (!targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /warn username' });
+            return { handled: true };
+        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName);
+        if (!targetMeta) {
+            sendChatWs(ws, { type: 'error', message: 'target must be online' });
+            return { handled: true };
+        }
+        const targetRole = await getChatRole(targetMeta.playerName);
+        if (!staffCanModerateTarget(role, targetRole)) {
+            sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
+            return { handled: true };
+        }
+        const warning = await registerViolation(targetMeta, ['manual_warn']);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: 'warn',
+            targetMeta,
+            detail: { warningCount: warning.warningCount, strikeLevel: warning.strikeLevel, command: raw }
+        });
+        await broadcastSystemMessage(sender.serverId, `[MOD] ${sender.playerName} warned ${targetMeta.playerName}`);
+        const targetSocket = chatSocketOf(sender.serverId, targetMeta.playerName);
+        if (targetSocket) {
+            const warnMsg = warning.justMuted
+                ? `Bạn bị cảnh cáo và đã bị mute ${formatMuteDuration(warning.muteUntil)}.`
+                : `Bạn bị cảnh cáo bởi ${sender.playerName} (${warning.warningCount}/${WARNING_LIMIT}).`;
+            sendChatWs(targetSocket, {
+                type: 'moderation_warning',
+                message: warnMsg,
+                warningCount: warning.warningCount,
+                strikeLevel: warning.strikeLevel,
+                reasons: ['manual_warn']
+            });
+        }
+        sendChatWs(ws, {
+            type: 'command_result',
+            message: `Warned ${targetMeta.playerName} (${warning.warningCount}/${WARNING_LIMIT})`
+        });
+        return { handled: true };
+    }
+
+    sendChatWs(ws, { type: 'error', message: 'Unknown command' });
+    return { handled: true };
+}
+
+function evaluateRateLimit(meta, options = {}) {
+    const key = policyUserKey(meta.userId, meta.playerName);
+    const now = Date.now();
+    let state = chatRateStateByUser.get(key);
+    if (!state) {
+        state = {
+            lastSentAt: 0,
+            recent: [],
+            muteUntil: 0
+        };
+    }
+
+    if (state.muteUntil && now < state.muteUntil) {
+        chatRateStateByUser.set(key, state);
+        return {
+            blocked: true,
+            reason: 'spam_mute',
+            muteUntil: new Date(state.muteUntil)
+        };
+    }
+
+    const minInterval = options.isPrivate ? Math.max(RATE_LIMIT_MIN_INTERVAL_MS, PRIVATE_CHAT_COOLDOWN_MS) : RATE_LIMIT_MIN_INTERVAL_MS;
+    if (state.lastSentAt && (now - state.lastSentAt) < minInterval) {
+        chatRateStateByUser.set(key, state);
+        return {
+            blocked: true,
+            reason: 'rate_limit',
+            retryMs: minInterval - (now - state.lastSentAt)
+        };
+    }
+
+    state.lastSentAt = now;
+    state.recent = state.recent.filter((ts) => now - ts <= RATE_LIMIT_BURST_WINDOW_MS);
+    state.recent.push(now);
+
+    if (state.recent.length >= RATE_LIMIT_BURST_COUNT) {
+        state.recent = [];
+        state.muteUntil = now + RATE_LIMIT_BURST_MUTE_MS;
+        chatRateStateByUser.set(key, state);
+        return {
+            blocked: true,
+            reason: 'spam_mute',
+            muteUntil: new Date(state.muteUntil)
+        };
+    }
+
+    chatRateStateByUser.set(key, state);
+    return { blocked: false };
+}
+
+function parseMuteUntil(value) {
+    if (!value) return null;
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return null;
+    return dt;
+}
+
+function getMuteStepDurationMs(strikeLevel) {
+    if (strikeLevel <= 0) return 0;
+    if (strikeLevel > MUTE_STEPS_MS.length) return MUTE_STEPS_MS[MUTE_STEPS_MS.length - 1];
+    return MUTE_STEPS_MS[strikeLevel - 1];
+}
+
+function formatMuteDuration(muteUntilDate) {
+    if (!muteUntilDate) return 'permanently';
+    const hours = Math.ceil(Math.max(0, muteUntilDate.getTime() - Date.now()) / (60 * 60 * 1000));
+    if (hours <= 24) return `${hours}h`;
+    const days = Math.ceil(hours / 24);
+    return `${days} day(s)`;
+}
+
+function moderationBlockMessage(moderation) {
+    if (!moderation || !moderation.blocked) return 'blocked';
+    if (moderation.reason === 'permanent') {
+        return 'Bạn đã bị mute vĩnh viễn do vi phạm nhiều lần.';
+    }
+    if (moderation.reason === 'temporary' || moderation.reason === 'spam_mute') {
+        return `Bạn đang bị mute ${formatMuteDuration(moderation.muteUntil)}.`;
+    }
+    if (moderation.reason === 'rate_limit') {
+        return 'Bạn gửi quá nhanh. Tối đa 1 tin/giây.';
+    }
+    return 'Tin nhắn bị chặn.';
+}
+
+async function getModerationState(meta) {
+    const userKey = policyUserKey(meta.userId, meta.playerName);
+    const { data, error } = await supabase
+        .from('chat_moderation_state')
+        .select('*')
+        .eq('user_key', userKey)
+        .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+
+    const initial = {
+        user_key: userKey,
+        user_id: meta.userId || null,
+        player_name: meta.playerName,
+        warning_count: 0,
+        strike_level: 0,
+        total_violations: 0,
+        last_violation_at: null,
+        mute_until: null,
+        is_permanent_mute: false
+    };
+    const { error: insertError } = await supabase
+        .from('chat_moderation_state')
+        .upsert(initial, { onConflict: 'user_key' });
+    if (insertError) throw insertError;
+    return initial;
+}
+
+function isMutedState(state) {
+    if (!state) return false;
+    const until = parseMuteUntil(state.mute_until);
+    return !!until && until.getTime() > Date.now();
+}
+
+async function saveModerationState(state) {
+    const payload = {
+        user_key: state.user_key,
+        user_id: state.user_id || null,
+        player_name: state.player_name || null,
+        warning_count: Number(state.warning_count || 0),
+        strike_level: Number(state.strike_level || 0),
+        total_violations: Number(state.total_violations || 0),
+        last_violation_at: state.last_violation_at || null,
+        mute_until: state.mute_until || null,
+        is_permanent_mute: !!state.is_permanent_mute
+    };
+    const { error } = await supabase
+        .from('chat_moderation_state')
+        .upsert(payload, { onConflict: 'user_key' });
+    if (error) throw error;
+}
+
+async function applyManualMuteToModerationState(targetMeta, muteUntilIso) {
+    const state = await getModerationState(targetMeta);
+    state.user_id = targetMeta.userId || state.user_id || null;
+    state.player_name = targetMeta.playerName || state.player_name || null;
+    state.mute_until = muteUntilIso;
+    await saveModerationState(state);
+}
+
+async function broadcastSystemMessage(serverId, text) {
+    const out = {
+        id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: 'chat_message',
+        channel: 'server',
+        serverId,
+        placeId: 0,
+        playerName: 'System',
+        displayName: 'System',
+        userId: 0,
+        text: String(text || ''),
+        createdAt: new Date().toISOString()
+    };
+    try {
+        await persistPublicChatMessage(out);
+    } catch (_) {}
+    await logChatMessageAudit({
+        serverId: out.serverId,
+        channel: out.channel,
+        roomId: null,
+        playerName: out.playerName,
+        displayName: out.displayName,
+        userId: out.userId,
+        textOriginal: out.text,
+        textSanitized: out.text,
+        reasons: ['staff_action'],
+        isMasked: false
+    });
+    await broadcastPublicChat(out);
+}
+
+async function registerViolation(meta, reasons) {
+    const state = await getModerationState(meta);
+    const nowIso = new Date().toISOString();
+    state.warning_count = Number(state.warning_count || 0) + 1;
+    state.total_violations = Number(state.total_violations || 0) + 1;
+    state.last_violation_at = nowIso;
+    state.player_name = meta.playerName;
+    state.user_id = meta.userId || null;
+
+    let justMuted = false;
+    let muteUntil = null;
+    if (state.warning_count >= WARNING_LIMIT) {
+        state.warning_count = 0;
+        state.strike_level = Number(state.strike_level || 0) + 1;
+        const durationMs = getMuteStepDurationMs(state.strike_level);
+        state.mute_until = new Date(Date.now() + durationMs).toISOString();
+        state.is_permanent_mute = false;
+        justMuted = true;
+        muteUntil = parseMuteUntil(state.mute_until);
+    }
+
+    await saveModerationState(state);
+    return {
+        warningCount: state.warning_count,
+        strikeLevel: Number(state.strike_level || 0),
+        justMuted,
+        muteUntil,
+        permanentMute: false,
+        reasons
+    };
+}
+
+function applyStrikeDecay(state) {
+    if (!state) return false;
+    const strikeLevel = Number(state.strike_level || 0);
+    if (strikeLevel <= 0) return false;
+    if (!state.last_violation_at) return false;
+    const lastViolation = new Date(state.last_violation_at).getTime();
+    if (!Number.isFinite(lastViolation)) return false;
+    const elapsed = Date.now() - lastViolation;
+    if (elapsed < STRIKE_DECAY_MS) return false;
+    const nextLevel = Math.max(0, strikeLevel - 1);
+    if (nextLevel === strikeLevel) return false;
+    state.strike_level = nextLevel;
+    state.last_violation_at = new Date().toISOString();
+    return true;
+}
+
+async function evaluateOutgoingChat(meta, rawText, options = {}) {
+    const state = await getModerationState(meta);
+    const decayed = applyStrikeDecay(state);
+    if (decayed) {
+        await saveModerationState(state);
+    }
+    if (isMutedState(state)) {
+        const until = parseMuteUntil(state.mute_until);
+        return {
+            blocked: true,
+            reason: state.is_permanent_mute ? 'permanent' : 'temporary',
+            muteUntil: until,
+            strikeLevel: Number(state.strike_level || 0)
+        };
+    }
+
+    const rate = evaluateRateLimit(meta, options);
+    if (rate.blocked) {
+        return {
+            blocked: true,
+            reason: rate.reason,
+            muteUntil: rate.muteUntil || null,
+            retryMs: rate.retryMs || 0,
+            strikeLevel: Number(state.strike_level || 0)
+        };
+    }
+
+    const policy = applyContentPolicy(rawText);
+    if (!policy.violated) {
+        return {
+            blocked: false,
+            text: policy.text,
+            warning: null
+        };
+    }
+
+    const warning = await registerViolation(meta, policy.reasons);
+    return {
+        blocked: false,
+        text: policy.text,
+        warning
+    };
+}
+
+async function createPrivateBlock(blockerMeta, targetMetaOrName) {
+    const blockerKey = policyUserKey(blockerMeta.userId, blockerMeta.playerName);
+    const blockerName = String(blockerMeta.playerName || '').trim();
+    const blockerUserId = Number(blockerMeta.userId || 0) || null;
+
+    const targetName = String(targetMetaOrName?.playerName || targetMetaOrName?.targetName || '').trim();
+    const targetUserId = Number(targetMetaOrName?.userId || 0) || 0;
+    const blockedKeys = policyUserKeys(targetUserId, targetName);
+    const payload = blockedKeys.map((blockedKey) => ({
+        blocker_key: blockerKey,
+        blocked_key: blockedKey,
+        blocker_name: blockerName,
+        blocker_name_lower: blockerName.toLowerCase(),
+        blocked_name: targetName,
+        blocked_name_lower: targetName.toLowerCase(),
+        blocker_user_id: blockerUserId,
+        blocked_user_id: targetUserId > 0 ? targetUserId : null
+    }));
+    const { error } = await supabase
+        .from('private_blocklist')
+        .upsert(payload, { onConflict: 'blocker_key,blocked_key' });
+    if (error) throw error;
+}
+
+async function isPrivateBlocked(blockedSenderMeta, targetMetaOrName) {
+    const senderKeys = policyUserKeys(blockedSenderMeta.userId, blockedSenderMeta.playerName);
+    const targetName = String(targetMetaOrName?.playerName || targetMetaOrName?.targetName || '').trim().toLowerCase();
+    const targetUserId = Number(targetMetaOrName?.userId || 0) || 0;
+    const targetKeys = policyUserKeys(targetUserId, targetName);
+
+    let query = supabase
+        .from('private_blocklist')
+        .select('id')
+        .in('blocked_key', senderKeys)
+        .limit(1);
+
+    if (targetKeys.length > 0) {
+        query = query.in('blocker_key', targetKeys);
+    } else {
+        query = query.eq('blocker_name_lower', targetName);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    return Array.isArray(data) && data.length > 0;
 }
 
 function serverChannelKey(serverId, channel = 'server') {
@@ -436,17 +1505,30 @@ function sendChatWs(ws, payload) {
     } catch (_) {}
 }
 
-function broadcastServerChat(serverId, payload) {
-    for (const client of chatClients) {
-        if (!client || !client.meta || client.meta.serverId !== serverId) continue;
-        sendChatWs(client, payload);
+async function buildViewerPayload(payload, viewerMeta) {
+    if (!payload || payload.type !== 'chat_message') return payload;
+    if (!viewerMeta) return payload;
+    if (payload.playerName === viewerMeta.playerName && payload.serverId === viewerMeta.serverId) {
+        return payload;
     }
+    const senderMeta = {
+        playerName: payload.playerName,
+        userId: payload.userId || 0
+    };
+    const hiddenByViewer = await hasUserMutedTarget(payload.serverId, viewerMeta, senderMeta);
+    if (!hiddenByViewer) return payload;
+    return {
+        ...payload,
+        text: MASKED_MESSAGE_TEXT
+    };
 }
 
-function broadcastGlobalChannel(payload) {
+async function broadcastPublicChat(payload) {
     for (const client of chatClients) {
         if (!client || !client.meta) continue;
-        sendChatWs(client, payload);
+        if (payload.channel === 'server' && client.meta.serverId !== payload.serverId) continue;
+        const perViewer = await buildViewerPayload(payload, client.meta);
+        sendChatWs(client, perViewer);
     }
 }
 
@@ -521,12 +1603,23 @@ function isPlayerInRoom(room, playerName) {
     return !!room && Array.isArray(room.players) && room.players.includes(playerName);
 }
 
-function broadcastPrivateRoom(room, payload) {
+async function broadcastPrivateRoom(room, payload) {
     if (!room || !Array.isArray(room.players)) return;
     for (const playerName of room.players) {
         const sock = chatSocketOf(room.serverId, playerName);
         if (sock) {
-            sendChatWs(sock, payload);
+            let out = payload;
+            if (payload && payload.type === 'chat_message' && payload.playerName && payload.playerName !== playerName) {
+                const hidden = await hasUserMutedTarget(
+                    room.serverId,
+                    { playerName, userId: sock.meta?.userId || 0 },
+                    { playerName: payload.playerName, userId: payload.userId || 0 }
+                );
+                if (hidden) {
+                    out = { ...payload, text: MASKED_MESSAGE_TEXT };
+                }
+            }
+            sendChatWs(sock, out);
         }
     }
 }
@@ -588,14 +1681,42 @@ robloxChatWsServer.on('connection', (ws) => {
 
             if (type === 'chat_message') {
                 const channel = String(msg.channel || 'server').toLowerCase();
-                let text = sanitizeChatText(msg.text);
+                const rawText = sanitizeChatText(msg.text);
+                let text = rawText;
                 if (!text) {
                     return;
                 }
-                text = censorBlockedChatText(text);
+                const commandResult = await executeSlashCommand(ws, rawText, { channel });
+                if (commandResult.handled) return;
                 if (!['server', 'en', 'vn'].includes(channel)) {
                     sendChatWs(ws, { type: 'error', message: 'invalid channel' });
                     return;
+                }
+
+                const banState = await getBanState(ws.meta);
+                if (banState) {
+                    sendChatWs(ws, {
+                        type: 'moderation_muted',
+                        message: 'Bạn đã bị ban khỏi chat.'
+                    });
+                    return;
+                }
+
+                const moderation = await evaluateOutgoingChat(ws.meta, rawText, { isPrivate: false });
+                if (moderation.blocked) {
+                    const detail = moderationBlockMessage(moderation);
+                    sendChatWs(ws, {
+                        type: 'moderation_muted',
+                        message: detail,
+                        strikeLevel: moderation.strikeLevel || 0
+                    });
+                    return;
+                }
+                text = moderation.text;
+                const adminMuteUntil = await getAdminMuteState(ws.meta);
+                const forceMaskByAdmin = !!adminMuteUntil;
+                if (forceMaskByAdmin) {
+                    text = MASKED_MESSAGE_TEXT;
                 }
 
                 const out = {
@@ -611,6 +1732,19 @@ robloxChatWsServer.on('connection', (ws) => {
                     createdAt: new Date().toISOString()
                 };
 
+                await logChatMessageAudit({
+                    serverId: out.serverId,
+                    channel: out.channel,
+                    roomId: null,
+                    playerName: out.playerName,
+                    displayName: out.displayName,
+                    userId: out.userId,
+                    textOriginal: rawText,
+                    textSanitized: out.text,
+                    reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
+                    isMasked: forceMaskByAdmin
+                });
+
                 let persistError = null;
                 try {
                     await persistPublicChatMessage(out);
@@ -618,10 +1752,20 @@ robloxChatWsServer.on('connection', (ws) => {
                     persistError = err;
                 }
 
-                if (channel === 'server') {
-                    broadcastServerChat(ws.meta.serverId, out);
-                } else {
-                    broadcastGlobalChannel(out);
+                await broadcastPublicChat(out);
+                if (moderation.warning) {
+                    const warnMsg = moderation.warning.justMuted
+                        ? (moderation.warning.permanentMute
+                            ? 'Tin nhắn bị kiểm duyệt. Bạn đã bị mute vĩnh viễn.'
+                            : `Tin nhắn bị kiểm duyệt. Bạn bị mute ${formatMuteDuration(moderation.warning.muteUntil)}.`)
+                        : `Tin nhắn bị kiểm duyệt (##). Cảnh cáo ${moderation.warning.warningCount}/${WARNING_LIMIT}.`;
+                    sendChatWs(ws, {
+                        type: 'moderation_warning',
+                        message: warnMsg,
+                        warningCount: moderation.warning.warningCount,
+                        strikeLevel: moderation.warning.strikeLevel,
+                        reasons: moderation.warning.reasons || []
+                    });
                 }
                 if (persistError) {
                     sendChatWs(ws, { type: 'error', message: 'chat history save failed' });
@@ -636,6 +1780,12 @@ robloxChatWsServer.on('connection', (ws) => {
                     return;
                 }
                 const targetSocket = chatSocketOf(ws.meta.serverId, targetName);
+                const targetMeta = targetSocket ? targetSocket.meta : { targetName };
+                const blockedByTarget = await isPrivateBlocked(ws.meta, targetMeta);
+                if (blockedByTarget) {
+                    sendChatWs(ws, { type: 'error', message: 'private blocked by target' });
+                    return;
+                }
                 if (!targetSocket) {
                     sendChatWs(ws, { type: 'error', message: 'target offline' });
                     return;
@@ -677,6 +1827,40 @@ robloxChatWsServer.on('connection', (ws) => {
                     inviteId: invite.id,
                     fromName: invite.fromName,
                     fromDisplayName: invite.fromDisplayName
+                });
+                return;
+            }
+
+            if (type === 'private_block') {
+                const targetName = String(msg.targetName || '').trim();
+                if (!targetName || targetName === ws.meta.playerName) {
+                    sendChatWs(ws, { type: 'error', message: 'invalid block target' });
+                    return;
+                }
+                const targetSocket = chatSocketOf(ws.meta.serverId, targetName);
+                const targetMeta = targetSocket ? targetSocket.meta : { targetName };
+                await createPrivateBlock(ws.meta, targetMeta);
+
+                for (const [inviteId, invite] of pendingPrivateInvites.entries()) {
+                    if (!invite || invite.serverId !== ws.meta.serverId) continue;
+                    const isPair = (invite.fromName === ws.meta.playerName && invite.toName === targetName)
+                        || (invite.fromName === targetName && invite.toName === ws.meta.playerName);
+                    if (!isPair) continue;
+                    pendingPrivateInvites.delete(inviteId);
+                }
+                const roomId = makePrivateRoomId(ws.meta.serverId, ws.meta.playerName, targetName);
+                const room = privateChatRooms.get(roomId);
+                if (room) {
+                    privateChatRooms.delete(roomId);
+                    broadcastPrivateRoom(room, {
+                        type: 'private_closed',
+                        roomId,
+                        by: ws.meta.playerName
+                    });
+                }
+                sendChatWs(ws, {
+                    type: 'private_blocked',
+                    targetName
                 });
                 return;
             }
@@ -740,9 +1924,44 @@ robloxChatWsServer.on('connection', (ws) => {
                     sendChatWs(ws, { type: 'error', message: 'private room not found' });
                     return;
                 }
-                let text = sanitizeChatText(msg.text);
+                const rawText = sanitizeChatText(msg.text);
+                let text = rawText;
                 if (!text) return;
-                text = censorBlockedChatText(text);
+                const commandResult = await executeSlashCommand(ws, rawText, { channel: 'private', roomId });
+                if (commandResult.handled) return;
+                const otherPlayerName = room.players.find((p) => p !== ws.meta.playerName) || '';
+                const otherSock = chatSocketOf(room.serverId, otherPlayerName);
+                const blockedByTarget = await isPrivateBlocked(ws.meta, otherSock ? otherSock.meta : { targetName: otherPlayerName });
+                if (blockedByTarget) {
+                    sendChatWs(ws, { type: 'error', message: 'private blocked by target' });
+                    return;
+                }
+
+                const banState = await getBanState(ws.meta);
+                if (banState) {
+                    sendChatWs(ws, {
+                        type: 'moderation_muted',
+                        message: 'Bạn đã bị ban khỏi chat.'
+                    });
+                    return;
+                }
+
+                const moderation = await evaluateOutgoingChat(ws.meta, rawText, { isPrivate: true });
+                if (moderation.blocked) {
+                    const detail = moderationBlockMessage(moderation);
+                    sendChatWs(ws, {
+                        type: 'moderation_muted',
+                        message: detail,
+                        strikeLevel: moderation.strikeLevel || 0
+                    });
+                    return;
+                }
+                text = moderation.text;
+                const adminMuteUntil = await getAdminMuteState(ws.meta);
+                const forceMaskByAdmin = !!adminMuteUntil;
+                if (forceMaskByAdmin) {
+                    text = MASKED_MESSAGE_TEXT;
+                }
                 room.updatedAt = Date.now();
                 const out = {
                     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -757,7 +1976,33 @@ robloxChatWsServer.on('connection', (ws) => {
                     text,
                     createdAt: new Date().toISOString()
                 };
-                broadcastPrivateRoom(room, out);
+                await logChatMessageAudit({
+                    serverId: out.serverId,
+                    channel: out.channel,
+                    roomId: out.roomId,
+                    playerName: out.playerName,
+                    displayName: out.displayName,
+                    userId: out.userId,
+                    textOriginal: rawText,
+                    textSanitized: out.text,
+                    reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
+                    isMasked: forceMaskByAdmin
+                });
+                await broadcastPrivateRoom(room, out);
+                if (moderation.warning) {
+                    const warnMsg = moderation.warning.justMuted
+                        ? (moderation.warning.permanentMute
+                            ? 'Tin nhắn bị kiểm duyệt. Bạn đã bị mute vĩnh viễn.'
+                            : `Tin nhắn bị kiểm duyệt. Bạn bị mute ${formatMuteDuration(moderation.warning.muteUntil)}.`)
+                        : `Tin nhắn bị kiểm duyệt (##). Cảnh cáo ${moderation.warning.warningCount}/${WARNING_LIMIT}.`;
+                    sendChatWs(ws, {
+                        type: 'moderation_warning',
+                        message: warnMsg,
+                        warningCount: moderation.warning.warningCount,
+                        strikeLevel: moderation.warning.strikeLevel,
+                        reasons: moderation.warning.reasons || []
+                    });
+                }
                 return;
             }
 
@@ -1728,6 +2973,87 @@ app.post('/check-time-left', async (req, res) => {
         });
     }
 });
+
+app.post('/admin/chat/mute', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = String(req.body?.username || '').trim();
+        const duration = String(req.body?.duration || '').trim();
+        const reason = String(req.body?.reason || '').trim() || 'manual admin mute';
+        const durationMs = parseDurationHms(duration);
+        if (!username || !durationMs) {
+            return res.status(400).json({ success: false, message: 'username and duration hh:mm:ss are required' });
+        }
+        const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
+        const mutedUntil = await upsertAdminMute(targetMeta, req.user.username, durationMs, reason);
+        return res.json({
+            success: true,
+            data: { username, mutedUntil, reason }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
+app.post('/admin/chat/unmute', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = String(req.body?.username || '').trim();
+        if (!username) {
+            return res.status(400).json({ success: false, message: 'username is required' });
+        }
+        await removeAdminMute(username);
+        return res.json({ success: true, data: { username } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
+app.post('/admin/chat/ban', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = String(req.body?.username || '').trim();
+        const reason = String(req.body?.reason || '').trim() || 'manual chat ban';
+        const duration = String(req.body?.duration || '').trim();
+        const durationMs = duration ? parseDurationHms(duration) : null;
+        if (!username) {
+            return res.status(400).json({ success: false, message: 'username is required' });
+        }
+        if (duration && !durationMs) {
+            return res.status(400).json({ success: false, message: 'duration must be hh:mm:ss' });
+        }
+        const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
+        const payload = {
+            user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+            username: targetMeta.playerName,
+            username_lower: usernameLower(targetMeta.playerName),
+            user_id: targetMeta.userId || null,
+            reason,
+            banned_by: req.user.username,
+            banned_until: durationMs ? new Date(Date.now() + durationMs).toISOString() : null,
+            is_permanent: !durationMs
+        };
+        const { error } = await supabase.from('ban_list').upsert(payload, { onConflict: 'user_key' });
+        if (error) throw error;
+        return res.json({ success: true, data: payload });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
+app.post('/admin/chat/unban', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = String(req.body?.username || '').trim().toLowerCase();
+        if (!username) {
+            return res.status(400).json({ success: false, message: 'username is required' });
+        }
+        const { error } = await supabase
+            .from('ban_list')
+            .delete()
+            .eq('username_lower', username);
+        if (error) throw error;
+        return res.json({ success: true, data: { username } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
 app.post('/api/blackflash/invite', (req, res) => {
     try {
         cleanupBlackFlashSessions();
@@ -1938,12 +3264,28 @@ app.post('/api/chat/server/send', async (req, res) => {
         const displayNameRaw = String(req.body?.displayName || '').trim();
         const displayName = displayNameRaw || playerName;
         const userId = Number(req.body?.userId || 0) || 0;
-        let text = sanitizeChatText(req.body?.text);
+        const rawText = sanitizeChatText(req.body?.text);
+        let text = rawText;
 
         if (!serverId || !playerName || !text) {
             return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
         }
-        text = censorBlockedChatText(text);
+        const senderMeta = buildSenderMeta({ serverId, placeId, playerName, displayName, userId });
+        const banState = await getBanState(senderMeta);
+        if (banState) {
+            return res.status(403).json({ success: false, message: 'Bạn đã bị ban khỏi chat.', type: 'moderation_banned' });
+        }
+        const moderation = await evaluateOutgoingChat(senderMeta, rawText, { isPrivate: false });
+        if (moderation.blocked) {
+            const detail = moderationBlockMessage(moderation);
+            return res.status(403).json({ success: false, message: detail, type: 'moderation_muted' });
+        }
+        text = moderation.text;
+        const adminMuteUntil = await getAdminMuteState(senderMeta);
+        const forceMaskByAdmin = !!adminMuteUntil;
+        if (forceMaskByAdmin) {
+            text = MASKED_MESSAGE_TEXT;
+        }
 
         const out = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1963,8 +3305,24 @@ app.post('/api/chat/server/send', async (req, res) => {
         } catch (err) {
             return res.status(500).json({ success: false, message: 'chat history save failed' });
         }
-        broadcastServerChat(serverId, out);
-        return res.json({ success: true, data: out });
+        await logChatMessageAudit({
+            serverId: out.serverId,
+            channel: out.channel,
+            roomId: null,
+            playerName: out.playerName,
+            displayName: out.displayName,
+            userId: out.userId,
+            textOriginal: rawText,
+            textSanitized: out.text,
+            reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
+            isMasked: forceMaskByAdmin
+        });
+        await broadcastPublicChat(out);
+        return res.json({
+            success: true,
+            data: out,
+            moderation: moderation.warning || null
+        });
     } catch (err) {
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
@@ -1978,7 +3336,8 @@ app.post('/api/chat/send', async (req, res) => {
         const displayName = displayNameRaw || playerName;
         const userId = Number(req.body?.userId || 0) || 0;
         const channel = String(req.body?.channel || 'server').trim().toLowerCase();
-        let text = sanitizeChatText(req.body?.text);
+        const rawText = sanitizeChatText(req.body?.text);
+        let text = rawText;
 
         if (!serverId || !playerName || !text) {
             return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
@@ -1986,7 +3345,22 @@ app.post('/api/chat/send', async (req, res) => {
         if (!['server', 'en', 'vn'].includes(channel)) {
             return res.status(400).json({ success: false, message: 'invalid channel' });
         }
-        text = censorBlockedChatText(text);
+        const senderMeta = buildSenderMeta({ serverId, placeId, playerName, displayName, userId });
+        const banState = await getBanState(senderMeta);
+        if (banState) {
+            return res.status(403).json({ success: false, message: 'Bạn đã bị ban khỏi chat.', type: 'moderation_banned' });
+        }
+        const moderation = await evaluateOutgoingChat(senderMeta, rawText, { isPrivate: false });
+        if (moderation.blocked) {
+            const detail = moderationBlockMessage(moderation);
+            return res.status(403).json({ success: false, message: detail, type: 'moderation_muted' });
+        }
+        text = moderation.text;
+        const adminMuteUntil = await getAdminMuteState(senderMeta);
+        const forceMaskByAdmin = !!adminMuteUntil;
+        if (forceMaskByAdmin) {
+            text = MASKED_MESSAGE_TEXT;
+        }
 
         const out = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -2006,14 +3380,25 @@ app.post('/api/chat/send', async (req, res) => {
         } catch (err) {
             return res.status(500).json({ success: false, message: 'chat history save failed' });
         }
+        await logChatMessageAudit({
+            serverId: out.serverId,
+            channel: out.channel,
+            roomId: null,
+            playerName: out.playerName,
+            displayName: out.displayName,
+            userId: out.userId,
+            textOriginal: rawText,
+            textSanitized: out.text,
+            reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
+            isMasked: forceMaskByAdmin
+        });
+        await broadcastPublicChat(out);
 
-        if (channel === 'server') {
-            broadcastServerChat(serverId, out);
-        } else {
-            broadcastGlobalChannel(out);
-        }
-
-        return res.json({ success: true, data: out });
+        return res.json({
+            success: true,
+            data: out,
+            moderation: moderation.warning || null
+        });
     } catch (err) {
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
