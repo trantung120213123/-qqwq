@@ -58,6 +58,8 @@ const chatMemoryHistoryByServer = new Map();
 const chatClients = new Set();
 const MAX_CHAT_HISTORY = 50;
 const PUBLIC_CHAT_CHANNELS = ['server', 'en', 'vn', 'global'];
+const SHARED_PUBLIC_HISTORY_SERVER_ID = '__shared_public__';
+const OWNER_USERNAME = 'tahabase2022';
 const HISTORY_LOAD_LIMIT_BY_CHANNEL = {
     server: 20,
     en: 50,
@@ -93,6 +95,9 @@ const LEVEL_XP_PUBLIC_MESSAGE = 4;
 const LEVEL_XP_PRIVATE_MESSAGE = 3;
 const LEVEL_XP_VIOLATION_PENALTY = 18;
 const LEVEL_XP_WARNING_PENALTY = 8;
+const XP_REWARD_WINDOW_MS = 10 * 1000;
+const XP_REPEAT_SAME_TEXT_MS = 900;
+const xpRewardStateByUser = new Map();
 
 function nowMs() {
     return Date.now();
@@ -103,6 +108,18 @@ function historyLoadLimitForChannel(channel, fallback = MAX_CHAT_HISTORY) {
     const fromMap = Number(HISTORY_LOAD_LIMIT_BY_CHANNEL[key] || 0) || 0;
     if (fromMap > 0) return fromMap;
     return Number(fallback || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY;
+}
+
+function scopedHistoryServerId(serverId, channel = 'server') {
+    const normalizedChannel = String(channel || 'server').toLowerCase();
+    if (normalizedChannel === 'server') {
+        return String(serverId || '').trim();
+    }
+    return SHARED_PUBLIC_HISTORY_SERVER_ID;
+}
+
+function isOwnerName(name) {
+    return String(name || '').trim().toLowerCase() === OWNER_USERNAME;
 }
 
 function cleanupChatClients() {
@@ -393,6 +410,25 @@ function sanitizeChatText(text) {
     return text.replace(/\s+/g, ' ').trim().slice(0, MAX_CHAT_TEXT_LENGTH);
 }
 
+function normalizeChatRewardText(text) {
+    return sanitizeChatText(text)
+        .toLowerCase()
+        .replace(/\s+/g, ' ');
+}
+
+function sanitizeReplyMeta(replyTo) {
+    if (!replyTo || typeof replyTo !== 'object') return null;
+    const id = String(replyTo.id || '').trim().slice(0, 64);
+    const playerName = String(replyTo.playerName || '').trim().slice(0, 32);
+    const preview = sanitizeChatText(String(replyTo.preview || '')).slice(0, 60);
+    if (!id && !playerName && !preview) return null;
+    return {
+        id: id || null,
+        playerName: playerName || 'Unknown',
+        preview: preview || ''
+    };
+}
+
 function cloneRegexWithGlobal(re) {
     const flags = re.flags.includes('g') ? re.flags : `${re.flags}g`;
     return new RegExp(re.source, flags);
@@ -637,6 +673,62 @@ async function applyPlayerXp(meta, xpDelta) {
     };
 }
 
+function calculateMessageXpGain(meta, text, options = {}) {
+    const isPrivate = !!options.isPrivate;
+    const base = isPrivate ? LEVEL_XP_PRIVATE_MESSAGE : LEVEL_XP_PUBLIC_MESSAGE;
+    const key = policyUserKey(meta.userId, meta.playerName);
+    const now = Date.now();
+    const normalized = normalizeChatRewardText(text);
+
+    const prev = xpRewardStateByUser.get(key) || {
+        windowStart: now,
+        burstCount: 0,
+        lastAt: 0,
+        lastText: ''
+    };
+    if ((now - prev.windowStart) > XP_REWARD_WINDOW_MS) {
+        prev.windowStart = now;
+        prev.burstCount = 0;
+    }
+    prev.burstCount += 1;
+
+    let reward = base;
+    if (normalized.length < 6) {
+        reward = Math.max(1, reward - 2);
+    }
+    if ((now - prev.lastAt) <= XP_REPEAT_SAME_TEXT_MS && normalized && normalized === prev.lastText) {
+        reward = 0;
+    } else if (prev.burstCount >= 8) {
+        reward = 0;
+    } else if (prev.burstCount >= 5) {
+        reward = Math.max(1, Math.floor(reward / 2));
+    }
+
+    prev.lastAt = now;
+    prev.lastText = normalized;
+    xpRewardStateByUser.set(key, prev);
+    return reward;
+}
+
+function calculateViolationPenalty(basePenalty, level, reasons, strikeLevel) {
+    let penalty = Math.max(1, Math.abs(Number(basePenalty || LEVEL_XP_VIOLATION_PENALTY)));
+    const lv = Math.max(1, Number(level || 1) || 1);
+    const sl = Math.max(0, Number(strikeLevel || 0) || 0);
+    if (lv >= 8) {
+        penalty += (lv - 7) * 8;
+    } else if (lv >= 5) {
+        penalty += (lv - 4) * 4;
+    }
+    if (sl > 0) {
+        penalty += Math.min(20, sl * 2);
+    }
+    const reasonSet = new Set(Array.isArray(reasons) ? reasons : []);
+    if (reasonSet.has('gore')) penalty += 8;
+    if (reasonSet.has('link')) penalty += 5;
+    if (reasonSet.has('abuse')) penalty += 4;
+    return Math.max(1, penalty);
+}
+
 async function getPlayerVisual(meta) {
     if (!meta || !meta.playerName) {
         return { level: 1, xp: 0, style: levelStyleName(1) };
@@ -691,6 +783,7 @@ function parseDurationShort(input) {
 async function getChatRole(username) {
     const uname = usernameLower(username);
     if (!uname) return 'user';
+    if (isOwnerName(uname)) return 'admin';
 
     const now = Date.now();
     const cached = modRoleCache.get(uname);
@@ -1480,7 +1573,9 @@ async function registerViolation(meta, reasons, options = {}) {
     }
 
     await saveModerationState(state);
-    const xpPenalty = Number(options.xpPenalty || LEVEL_XP_VIOLATION_PENALTY);
+    const basePenalty = Number(options.xpPenalty || LEVEL_XP_VIOLATION_PENALTY);
+    const currentVisual = await getPlayerVisual(meta);
+    const xpPenalty = calculateViolationPenalty(basePenalty, currentVisual.level, reasons, state.strike_level);
     const visual = await applyPlayerXp(meta, -Math.abs(xpPenalty));
     return {
         warningCount: state.warning_count,
@@ -1490,7 +1585,8 @@ async function registerViolation(meta, reasons, options = {}) {
         permanentMute: false,
         reasons,
         level: visual.level,
-        levelStyle: visual.style
+        levelStyle: visual.style,
+        xpPenalty
     };
 }
 
@@ -1625,7 +1721,8 @@ async function isPrivateBlocked(blockedSenderMeta, targetMetaOrName) {
 }
 
 function serverChannelKey(serverId, channel = 'server') {
-    return `${serverId}:${channel}`;
+    const scopedServerId = scopedHistoryServerId(serverId, channel);
+    return `${scopedServerId}:${channel}`;
 }
 
 function getServerMemoryHistory(serverId, channel = 'server') {
@@ -1645,14 +1742,16 @@ function pushServerMemoryHistory(serverId, channel, message) {
 }
 
 async function saveServerChatMessage(message) {
+    const channel = String(message.channel || 'server').toLowerCase();
     const payload = {
-        server_id: message.serverId,
-        channel: message.channel || 'server',
+        server_id: scopedHistoryServerId(message.serverId, channel),
+        channel: channel,
         place_id: message.placeId || null,
         player_name: message.playerName,
         display_name: message.displayName,
         user_id: message.userId || null,
         text: message.text,
+        reply_to: message.replyTo || null,
         sender_level: Number(message.level || 1) || 1,
         sender_style: String(message.levelStyle || levelStyleName(message.level || 1)),
         sender_role: String(message.senderRole || 'user')
@@ -1664,10 +1763,11 @@ async function saveServerChatMessage(message) {
 }
 
 async function pruneServerChatHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
+    const scopedServerId = scopedHistoryServerId(serverId, channel);
     const { data, error } = await supabase
         .from('chat_history')
         .select('id')
-        .eq('server_id', serverId)
+        .eq('server_id', scopedServerId)
         .eq('channel', channel)
         .order('created_at', { ascending: false })
         .range(limit, limit + 5000);
@@ -1680,17 +1780,56 @@ async function pruneServerChatHistory(serverId, channel = 'server', limit = MAX_
 }
 
 async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
-    const { data, error } = await supabase
-        .from('chat_history')
-        .select('*')
-        .eq('server_id', serverId)
-        .eq('channel', channel)
-        .order('created_at', { ascending: false })
-        .limit(limit);
-    if (error) {
-        throw error;
+    const normalizedChannel = String(channel || 'server').toLowerCase();
+    const scopedServerId = scopedHistoryServerId(serverId, normalizedChannel);
+    let rows = [];
+    if (normalizedChannel === 'server') {
+        const { data, error } = await supabase
+            .from('chat_history')
+            .select('*')
+            .eq('channel', normalizedChannel)
+            .eq('server_id', scopedServerId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+        if (error) throw error;
+        rows = data || [];
+    } else {
+        // Query shared scope + legacy per-server scope separately, then merge.
+        const legacyServerId = String(serverId || '').trim();
+        const [sharedResult, legacyResult] = await Promise.allSettled([
+            supabase
+                .from('chat_history')
+                .select('*')
+                .eq('channel', normalizedChannel)
+                .eq('server_id', scopedServerId)
+                .order('created_at', { ascending: false })
+                .limit(limit),
+            supabase
+                .from('chat_history')
+                .select('*')
+                .eq('channel', normalizedChannel)
+                .eq('server_id', legacyServerId)
+                .order('created_at', { ascending: false })
+                .limit(limit)
+        ]);
+
+        if (sharedResult.status === 'fulfilled' && !sharedResult.value.error) {
+            rows.push(...(sharedResult.value.data || []));
+        }
+        if (legacyResult.status === 'fulfilled' && !legacyResult.value.error) {
+            rows.push(...(legacyResult.value.data || []));
+        }
+        rows.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+        const seen = new Set();
+        rows = rows.filter((row) => {
+            const key = row?.id ? `id:${row.id}` : `${row?.server_id || ''}:${row?.channel || ''}:${row?.player_name || ''}:${row?.created_at || ''}:${row?.text || ''}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice(0, limit);
     }
-    return (data || []).reverse().map((row) => ({
+
+    return rows.reverse().map((row) => ({
         id: row.id,
         channel: row.channel || 'server',
         serverId: row.server_id,
@@ -1699,19 +1838,54 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
         displayName: row.display_name || row.player_name,
         userId: row.user_id || 0,
         text: row.text,
-        level: Number(row.sender_level || 1) || 1,
-        levelStyle: String(row.sender_style || levelStyleName(Number(row.sender_level || 1))),
-        senderRole: String(row.sender_role || 'user'),
+        replyTo: row.reply_to || null,
+        level: isOwnerName(row.player_name) ? MAX_CHAT_LEVEL : (Number(row.sender_level || 1) || 1),
+        levelStyle: isOwnerName(row.player_name)
+            ? levelStyleName(MAX_CHAT_LEVEL)
+            : String(row.sender_style || levelStyleName(Number(row.sender_level || 1))),
+        senderRole: isOwnerName(row.player_name)
+            ? 'admin'
+            : String(row.sender_role || 'user'),
         createdAt: row.created_at || new Date().toISOString()
     }));
+}
+
+function dedupeMergedHistory(items) {
+    const seen = new Set();
+    const out = [];
+    for (const item of items) {
+        if (!item) continue;
+        const key = item.id
+            ? `id:${item.id}`
+            : `mem:${item.serverId || ''}:${item.channel || ''}:${item.playerName || ''}:${item.userId || 0}:${item.createdAt || ''}:${item.text || ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(item);
+    }
+    out.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return out;
+}
+
+async function fetchMergedServerHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
+    const safeLimit = Math.min(Math.max(Number(limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
+    const memoryHistory = getServerMemoryHistory(serverId, channel);
+    const memorySlice = memoryHistory.slice(Math.max(0, memoryHistory.length - safeLimit));
+    let dbHistory = [];
+    try {
+        dbHistory = await fetchServerChatHistory(serverId, channel, safeLimit);
+    } catch (_) {
+        dbHistory = [];
+    }
+    const merged = dedupeMergedHistory([...dbHistory, ...memorySlice]);
+    return merged.slice(Math.max(0, merged.length - safeLimit));
 }
 
 async function fetchPublicChatHistoryAllChannels(serverId, limit = MAX_CHAT_HISTORY) {
     const safeLimit = Math.min(Math.max(Number(limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
     const groupsSettled = await Promise.allSettled(
-        PUBLIC_CHAT_CHANNELS.map((channel) => {
+        PUBLIC_CHAT_CHANNELS.map(async (channel) => {
             const perChannelLimit = Math.min(historyLoadLimitForChannel(channel, safeLimit), safeLimit);
-            return fetchServerChatHistory(serverId, channel, perChannelLimit);
+            return fetchMergedServerHistory(serverId, channel, perChannelLimit);
         })
     );
 
@@ -1722,8 +1896,7 @@ async function fetchPublicChatHistoryAllChannels(serverId, limit = MAX_CHAT_HIST
         }
     }
 
-    merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-    return merged;
+    return dedupeMergedHistory(merged);
 }
 
 function sendChatWs(ws, payload) {
@@ -1899,15 +2072,6 @@ robloxChatWsServer.on('connection', (ws) => {
                 } catch (_) {
                     history = [];
                 }
-                if (!Array.isArray(history) || history.length === 0) {
-                    history = [];
-                    for (const ch of PUBLIC_CHAT_CHANNELS) {
-                        const memory = getServerMemoryHistory(serverId, ch);
-                        const perChannelLimit = historyLoadLimitForChannel(ch, MAX_CHAT_HISTORY);
-                        history.push(...memory.slice(Math.max(0, memory.length - perChannelLimit)));
-                    }
-                    history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-                }
                 sendChatWs(ws, {
                     type: 'registered',
                     serverId,
@@ -1925,6 +2089,7 @@ robloxChatWsServer.on('connection', (ws) => {
             if (type === 'chat_message') {
                 const channel = String(msg.channel || 'server').toLowerCase();
                 const rawText = sanitizeChatText(msg.text);
+                const replyTo = sanitizeReplyMeta(msg.replyTo);
                 let text = rawText;
                 if (!text) {
                     return;
@@ -1966,7 +2131,7 @@ robloxChatWsServer.on('connection', (ws) => {
                         level: Number(moderation.warning.level || 1) || 1,
                         style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
                     }
-                    : await applyPlayerXp(ws.meta, LEVEL_XP_PUBLIC_MESSAGE);
+                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: false }));
                 const senderRole = await getChatRole(ws.meta.playerName);
 
                 const out = {
@@ -1979,6 +2144,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     displayName: ws.meta.displayName,
                     userId: ws.meta.userId,
                     text,
+                    replyTo,
                     level: visual.level,
                     levelStyle: visual.style,
                     senderRole,
@@ -2196,6 +2362,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     return;
                 }
                 const rawText = sanitizeChatText(msg.text);
+                const replyTo = sanitizeReplyMeta(msg.replyTo);
                 let text = rawText;
                 if (!text) return;
                 const commandResult = await executeSlashCommand(ws, rawText, { channel: 'private', roomId });
@@ -2238,7 +2405,7 @@ robloxChatWsServer.on('connection', (ws) => {
                         level: Number(moderation.warning.level || 1) || 1,
                         style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
                     }
-                    : await applyPlayerXp(ws.meta, LEVEL_XP_PRIVATE_MESSAGE);
+                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: true }));
                 const senderRole = await getChatRole(ws.meta.playerName);
                 room.updatedAt = Date.now();
                 const out = {
@@ -2252,6 +2419,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     displayName: ws.meta.displayName,
                     userId: ws.meta.userId,
                     text,
+                    replyTo,
                     level: visual.level,
                     levelStyle: visual.style,
                     senderRole,
@@ -3566,6 +3734,7 @@ app.post('/api/chat/server/send', async (req, res) => {
         const displayName = displayNameRaw || playerName;
         const userId = Number(req.body?.userId || 0) || 0;
         const rawText = sanitizeChatText(req.body?.text);
+        const replyTo = sanitizeReplyMeta(req.body?.replyTo);
         let text = rawText;
 
         if (!serverId || !playerName || !text) {
@@ -3592,7 +3761,7 @@ app.post('/api/chat/server/send', async (req, res) => {
                 level: Number(moderation.warning.level || 1) || 1,
                 style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
             }
-            : await applyPlayerXp(senderMeta, LEVEL_XP_PUBLIC_MESSAGE);
+            : await applyPlayerXp(senderMeta, calculateMessageXpGain(senderMeta, rawText, { isPrivate: false }));
         const senderRole = await getChatRole(senderMeta.playerName);
 
         const out = {
@@ -3605,6 +3774,7 @@ app.post('/api/chat/server/send', async (req, res) => {
             displayName,
             userId,
             text,
+            replyTo,
             level: visual.level,
             levelStyle: visual.style,
             senderRole,
@@ -3648,6 +3818,7 @@ app.post('/api/chat/send', async (req, res) => {
         const userId = Number(req.body?.userId || 0) || 0;
         const channel = String(req.body?.channel || 'server').trim().toLowerCase();
         const rawText = sanitizeChatText(req.body?.text);
+        const replyTo = sanitizeReplyMeta(req.body?.replyTo);
         let text = rawText;
 
         if (!serverId || !playerName || !text) {
@@ -3677,7 +3848,7 @@ app.post('/api/chat/send', async (req, res) => {
                 level: Number(moderation.warning.level || 1) || 1,
                 style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
             }
-            : await applyPlayerXp(senderMeta, LEVEL_XP_PUBLIC_MESSAGE);
+            : await applyPlayerXp(senderMeta, calculateMessageXpGain(senderMeta, rawText, { isPrivate: false }));
         const senderRole = await getChatRole(senderMeta.playerName);
 
         const out = {
@@ -3690,6 +3861,7 @@ app.post('/api/chat/send', async (req, res) => {
             displayName,
             userId,
             text,
+            replyTo,
             level: visual.level,
             levelStyle: visual.style,
             senderRole,
@@ -3742,20 +3914,9 @@ app.get('/api/chat/server/history', async (req, res) => {
         try {
             history = allChannels
                 ? await fetchPublicChatHistoryAllChannels(serverId, limit)
-                : await fetchServerChatHistory(serverId, channelRaw, limit);
+                : await fetchMergedServerHistory(serverId, channelRaw, limit);
         } catch (_) {
-            if (allChannels) {
-                history = [];
-                for (const ch of PUBLIC_CHAT_CHANNELS) {
-                    const memoryHistory = getServerMemoryHistory(serverId, ch);
-                    const perChannelLimit = Math.min(historyLoadLimitForChannel(ch, limit), limit);
-                    history.push(...memoryHistory.slice(Math.max(0, memoryHistory.length - perChannelLimit)));
-                }
-                history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-            } else {
-                const memoryHistory = getServerMemoryHistory(serverId, channelRaw);
-                history = memoryHistory.slice(Math.max(0, memoryHistory.length - limit));
-            }
+            history = [];
         }
 
         return res.json({
