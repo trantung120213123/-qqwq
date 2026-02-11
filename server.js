@@ -338,15 +338,20 @@ function censorBlockedChatText(text) {
     return output;
 }
 
-function getServerMemoryHistory(serverId) {
-    if (!chatMemoryHistoryByServer.has(serverId)) {
-        chatMemoryHistoryByServer.set(serverId, []);
-    }
-    return chatMemoryHistoryByServer.get(serverId);
+function serverChannelKey(serverId, channel = 'server') {
+    return `${serverId}:${channel}`;
 }
 
-function pushServerMemoryHistory(serverId, message) {
-    const list = getServerMemoryHistory(serverId);
+function getServerMemoryHistory(serverId, channel = 'server') {
+    const key = serverChannelKey(serverId, channel);
+    if (!chatMemoryHistoryByServer.has(key)) {
+        chatMemoryHistoryByServer.set(key, []);
+    }
+    return chatMemoryHistoryByServer.get(key);
+}
+
+function pushServerMemoryHistory(serverId, channel, message) {
+    const list = getServerMemoryHistory(serverId, channel);
     list.push(message);
     if (list.length > MAX_CHAT_HISTORY) {
         list.splice(0, list.length - MAX_CHAT_HISTORY);
@@ -356,6 +361,7 @@ function pushServerMemoryHistory(serverId, message) {
 async function saveServerChatMessage(message) {
     const payload = {
         server_id: message.serverId,
+        channel: message.channel || 'server',
         place_id: message.placeId || null,
         player_name: message.playerName,
         display_name: message.displayName,
@@ -368,11 +374,12 @@ async function saveServerChatMessage(message) {
     }
 }
 
-async function pruneServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
+async function pruneServerChatHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
     const { data, error } = await supabase
         .from('chat_history')
         .select('id')
         .eq('server_id', serverId)
+        .eq('channel', channel)
         .order('created_at', { ascending: false })
         .range(limit, limit + 5000);
     if (error || !data || data.length === 0) {
@@ -383,11 +390,12 @@ async function pruneServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
     await supabase.from('chat_history').delete().in('id', ids);
 }
 
-async function fetchServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
+async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
     const { data, error } = await supabase
         .from('chat_history')
         .select('*')
         .eq('server_id', serverId)
+        .eq('channel', channel)
         .order('created_at', { ascending: false })
         .limit(limit);
     if (error) {
@@ -395,7 +403,7 @@ async function fetchServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
     }
     return (data || []).reverse().map((row) => ({
         id: row.id,
-        channel: 'server',
+        channel: row.channel || 'server',
         serverId: row.server_id,
         placeId: row.place_id,
         playerName: row.player_name,
@@ -404,6 +412,21 @@ async function fetchServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
         text: row.text,
         createdAt: row.created_at || new Date().toISOString()
     }));
+}
+
+async function fetchPublicChatHistoryAllChannels(serverId, limit = MAX_CHAT_HISTORY) {
+    const channels = ['server', 'en', 'vn'];
+    const groups = await Promise.all(
+        channels.map((channel) => fetchServerChatHistory(serverId, channel, limit))
+    );
+
+    const merged = [];
+    for (const list of groups) {
+        merged.push(...list);
+    }
+
+    merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return merged;
 }
 
 function sendChatWs(ws, payload) {
@@ -424,6 +447,17 @@ function broadcastGlobalChannel(payload) {
     for (const client of chatClients) {
         if (!client || !client.meta) continue;
         sendChatWs(client, payload);
+    }
+}
+
+async function persistPublicChatMessage(out) {
+    pushServerMemoryHistory(out.serverId, out.channel, out);
+    try {
+        await saveServerChatMessage(out);
+        await pruneServerChatHistory(out.serverId, out.channel, MAX_CHAT_HISTORY);
+    } catch (err) {
+        console.error('[chat] save history failed:', err?.message || err);
+        throw err;
     }
 }
 
@@ -530,9 +564,13 @@ robloxChatWsServer.on('connection', (ws) => {
                 chatClients.add(ws);
                 let history = [];
                 try {
-                    history = await fetchServerChatHistory(serverId, MAX_CHAT_HISTORY);
+                    history = await fetchPublicChatHistoryAllChannels(serverId, MAX_CHAT_HISTORY);
                 } catch (_) {
-                    history = getServerMemoryHistory(serverId);
+                    history = [];
+                    for (const ch of ['server', 'en', 'vn']) {
+                        history.push(...getServerMemoryHistory(serverId, ch));
+                    }
+                    history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
                 }
                 sendChatWs(ws, {
                     type: 'registered',
@@ -573,15 +611,20 @@ robloxChatWsServer.on('connection', (ws) => {
                     createdAt: new Date().toISOString()
                 };
 
+                let persistError = null;
+                try {
+                    await persistPublicChatMessage(out);
+                } catch (err) {
+                    persistError = err;
+                }
+
                 if (channel === 'server') {
-                    pushServerMemoryHistory(ws.meta.serverId, out);
-                    try {
-                        await saveServerChatMessage(out);
-                        await pruneServerChatHistory(ws.meta.serverId, MAX_CHAT_HISTORY);
-                    } catch (_) {}
                     broadcastServerChat(ws.meta.serverId, out);
                 } else {
                     broadcastGlobalChannel(out);
+                }
+                if (persistError) {
+                    sendChatWs(ws, { type: 'error', message: 'chat history save failed' });
                 }
                 return;
             }
@@ -1915,12 +1958,61 @@ app.post('/api/chat/server/send', async (req, res) => {
             createdAt: new Date().toISOString()
         };
 
-        pushServerMemoryHistory(serverId, out);
         try {
-            await saveServerChatMessage(out);
-            await pruneServerChatHistory(serverId, MAX_CHAT_HISTORY);
-        } catch (_) {}
+            await persistPublicChatMessage(out);
+        } catch (err) {
+            return res.status(500).json({ success: false, message: 'chat history save failed' });
+        }
         broadcastServerChat(serverId, out);
+        return res.json({ success: true, data: out });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+app.post('/api/chat/send', async (req, res) => {
+    try {
+        const serverId = String(req.body?.serverId || '').trim();
+        const placeId = Number(req.body?.placeId || 0) || 0;
+        const playerName = String(req.body?.playerName || '').trim();
+        const displayNameRaw = String(req.body?.displayName || '').trim();
+        const displayName = displayNameRaw || playerName;
+        const userId = Number(req.body?.userId || 0) || 0;
+        const channel = String(req.body?.channel || 'server').trim().toLowerCase();
+        let text = sanitizeChatText(req.body?.text);
+
+        if (!serverId || !playerName || !text) {
+            return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
+        }
+        if (!['server', 'en', 'vn'].includes(channel)) {
+            return res.status(400).json({ success: false, message: 'invalid channel' });
+        }
+        text = censorBlockedChatText(text);
+
+        const out = {
+            id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            type: 'chat_message',
+            channel,
+            serverId,
+            placeId,
+            playerName,
+            displayName,
+            userId,
+            text,
+            createdAt: new Date().toISOString()
+        };
+
+        try {
+            await persistPublicChatMessage(out);
+        } catch (err) {
+            return res.status(500).json({ success: false, message: 'chat history save failed' });
+        }
+
+        if (channel === 'server') {
+            broadcastServerChat(serverId, out);
+        } else {
+            broadcastGlobalChannel(out);
+        }
+
         return res.json({ success: true, data: out });
     } catch (err) {
         return res.status(500).json({ success: false, message: 'internal server error' });
@@ -1929,23 +2021,42 @@ app.post('/api/chat/server/send', async (req, res) => {
 app.get('/api/chat/server/history', async (req, res) => {
     try {
         const serverId = String(req.query?.serverId || '').trim();
+        const channelRaw = String(req.query?.channel || 'server').trim().toLowerCase();
+        const allChannels = channelRaw === 'all';
         const limit = Math.min(Math.max(Number(req.query?.limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
         if (!serverId) {
             return res.status(400).json({ success: false, message: 'missing serverId' });
         }
+        if (!allChannels && !['server', 'en', 'vn'].includes(channelRaw)) {
+            return res.status(400).json({ success: false, message: 'invalid channel' });
+        }
 
         let history = [];
         try {
-            history = await fetchServerChatHistory(serverId, limit);
+            history = allChannels
+                ? await fetchPublicChatHistoryAllChannels(serverId, limit)
+                : await fetchServerChatHistory(serverId, channelRaw, limit);
         } catch (_) {
-            const memoryHistory = getServerMemoryHistory(serverId);
-            history = memoryHistory.slice(Math.max(0, memoryHistory.length - limit));
+            if (allChannels) {
+                history = [];
+                for (const ch of ['server', 'en', 'vn']) {
+                    history.push(...getServerMemoryHistory(serverId, ch));
+                }
+                history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+                if (history.length > (limit * 3)) {
+                    history = history.slice(history.length - (limit * 3));
+                }
+            } else {
+                const memoryHistory = getServerMemoryHistory(serverId, channelRaw);
+                history = memoryHistory.slice(Math.max(0, memoryHistory.length - limit));
+            }
         }
 
         return res.json({
             success: true,
             data: {
                 serverId,
+                channel: allChannels ? 'all' : channelRaw,
                 history
             }
         });
