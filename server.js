@@ -27,6 +27,26 @@ const io = new Server(server, {
         methods: ['GET', 'POST']
     }
 });
+
+const blackFlashSessions = new Map();
+const BLACKFLASH_TTL_MS = 15 * 60 * 1000;
+
+function nowMs() {
+    return Date.now();
+}
+
+function createBlackFlashId() {
+    return `bf_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
+}
+
+function cleanupBlackFlashSessions() {
+    const current = nowMs();
+    for (const [id, session] of blackFlashSessions.entries()) {
+        if (!session || (current - (session.updatedAt || current)) > BLACKFLASH_TTL_MS) {
+            blackFlashSessions.delete(id);
+        }
+    }
+}
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -939,6 +959,208 @@ app.post('/check-time-left', async (req, res) => {
             success: false,
             message: 'Lỗi server nội bộ'
         });
+    }
+});
+app.post('/api/blackflash/invite', (req, res) => {
+    try {
+        cleanupBlackFlashSessions();
+        const { sender, receiver, serverId, placeId } = req.body || {};
+        if (!sender || !receiver || !serverId) {
+            return res.status(400).json({ success: false, message: 'Thiếu sender/receiver/serverId' });
+        }
+        if (sender === receiver) {
+            return res.status(400).json({ success: false, message: 'Không thể tự mời chính mình' });
+        }
+
+        for (const session of blackFlashSessions.values()) {
+            const samePair = session.serverId === serverId &&
+                ((session.sender === sender && session.receiver === receiver) ||
+                 (session.sender === receiver && session.receiver === sender));
+            const active = ['pending', 'accepted', 'started'].includes(session.status);
+            if (samePair && active) {
+                session.updatedAt = nowMs();
+                return res.json({
+                    success: true,
+                    data: {
+                        inviteId: session.id,
+                        status: session.status
+                    }
+                });
+            }
+        }
+
+        const id = createBlackFlashId();
+        blackFlashSessions.set(id, {
+            id,
+            sender,
+            receiver,
+            serverId,
+            placeId: placeId || null,
+            status: 'pending',
+            senderReady: false,
+            receiverReady: false,
+            createdAt: nowMs(),
+            updatedAt: nowMs()
+        });
+
+        return res.json({
+            success: true,
+            data: {
+                inviteId: id,
+                status: 'pending'
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
+    }
+});
+app.post('/api/blackflash/respond', (req, res) => {
+    try {
+        cleanupBlackFlashSessions();
+        const { inviteId, player, accepted, serverId } = req.body || {};
+        if (!inviteId || !player) {
+            return res.status(400).json({ success: false, message: 'Thiếu inviteId/player' });
+        }
+        const session = blackFlashSessions.get(inviteId);
+        if (!session) {
+            return res.status(404).json({ success: false, message: 'Không tìm thấy lời mời' });
+        }
+        if (serverId && session.serverId !== serverId) {
+            return res.status(400).json({ success: false, message: 'Sai server' });
+        }
+        if (session.receiver !== player && session.sender !== player) {
+            return res.status(403).json({ success: false, message: 'Không có quyền phản hồi lời mời này' });
+        }
+
+        if (!accepted) {
+            session.status = 'rejected';
+            session.updatedAt = nowMs();
+            return res.json({ success: true, data: { inviteId, status: session.status } });
+        }
+
+        session.status = 'accepted';
+        session.updatedAt = nowMs();
+        return res.json({
+            success: true,
+            data: {
+                inviteId,
+                status: session.status,
+                sender: session.sender,
+                receiver: session.receiver
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
+    }
+});
+app.post('/api/blackflash/start', (req, res) => {
+    try {
+        cleanupBlackFlashSessions();
+        const { inviteId, player, role, ready, serverId } = req.body || {};
+        if (!inviteId || !player) {
+            return res.status(400).json({ success: false, message: 'Thiếu inviteId/player' });
+        }
+        const session = blackFlashSessions.get(inviteId);
+        if (!session) {
+            return res.status(404).json({ success: false, message: 'Không tìm thấy phòng blackflash' });
+        }
+        if (serverId && session.serverId !== serverId) {
+            return res.status(400).json({ success: false, message: 'Sai server' });
+        }
+
+        const setReady = ready !== false;
+        if (player === session.sender || role === 'sender') {
+            session.senderReady = setReady;
+        } else if (player === session.receiver || role === 'receiver') {
+            session.receiverReady = setReady;
+        } else {
+            return res.status(403).json({ success: false, message: 'Không có quyền start phòng này' });
+        }
+
+        if (session.senderReady && session.receiverReady) {
+            session.status = 'started';
+        } else if (session.status !== 'rejected' && session.status !== 'ended') {
+            session.status = 'accepted';
+        }
+        session.updatedAt = nowMs();
+
+        return res.json({
+            success: true,
+            data: {
+                inviteId,
+                status: session.status,
+                senderReady: session.senderReady,
+                receiverReady: session.receiverReady
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
+    }
+});
+app.post('/api/blackflash/poll', (req, res) => {
+    try {
+        cleanupBlackFlashSessions();
+        const { player, serverId } = req.body || {};
+        if (!player || !serverId) {
+            return res.status(400).json({ success: false, message: 'Thiếu player/serverId' });
+        }
+
+        let incomingInvite = null;
+        let sessionData = null;
+
+        for (const session of blackFlashSessions.values()) {
+            if (session.serverId !== serverId) continue;
+            if (!incomingInvite && session.status === 'pending' && session.receiver === player) {
+                incomingInvite = {
+                    inviteId: session.id,
+                    sender: session.sender,
+                    receiver: session.receiver
+                };
+            }
+
+            const active = ['accepted', 'started'].includes(session.status);
+            if (!sessionData && active && (session.sender === player || session.receiver === player)) {
+                const isSender = session.sender === player;
+                sessionData = {
+                    inviteId: session.id,
+                    status: session.status,
+                    accepted: session.status === 'accepted' || session.status === 'started',
+                    partnerName: isSender ? session.receiver : session.sender,
+                    partnerReady: isSender ? session.receiverReady : session.senderReady
+                };
+            }
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                incomingInvite,
+                session: sessionData
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
+    }
+});
+app.post('/api/blackflash/end', (req, res) => {
+    try {
+        const { inviteId, player } = req.body || {};
+        if (!inviteId) {
+            return res.status(400).json({ success: false, message: 'Thiếu inviteId' });
+        }
+        const session = blackFlashSessions.get(inviteId);
+        if (!session) {
+            return res.json({ success: true, data: { inviteId, status: 'ended' } });
+        }
+        if (player && player !== session.sender && player !== session.receiver) {
+            return res.status(403).json({ success: false, message: 'Không có quyền kết thúc session' });
+        }
+        session.status = 'ended';
+        session.updatedAt = nowMs();
+        blackFlashSessions.delete(inviteId);
+        return res.json({ success: true, data: { inviteId, status: 'ended' } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
     }
 });
 // Health check endpoint
