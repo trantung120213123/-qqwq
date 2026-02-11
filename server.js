@@ -29,19 +29,36 @@ const io = new Server(server, {
     }
 });
 const blackFlashWsServer = new WebSocket.Server({ noServer: true });
+const robloxChatWsServer = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
-    if (!request.url || !request.url.startsWith('/blackflash-ws')) {
+    if (!request.url) {
+        socket.destroy();
         return;
     }
-    blackFlashWsServer.handleUpgrade(request, socket, head, (ws) => {
-        blackFlashWsServer.emit('connection', ws, request);
-    });
+    if (request.url.startsWith('/blackflash-ws')) {
+        blackFlashWsServer.handleUpgrade(request, socket, head, (ws) => {
+            blackFlashWsServer.emit('connection', ws, request);
+        });
+        return;
+    }
+    if (request.url.startsWith('/chat-ws')) {
+        robloxChatWsServer.handleUpgrade(request, socket, head, (ws) => {
+            robloxChatWsServer.emit('connection', ws, request);
+        });
+        return;
+    }
+    socket.destroy();
 });
 
 const blackFlashSessions = new Map();
 const blackFlashSockets = new Map();
 const BLACKFLASH_TTL_MS = 15 * 60 * 1000;
+const chatMemoryHistoryByServer = new Map();
+const chatClients = new Set();
+const MAX_CHAT_HISTORY = 500;
+const privateChatRooms = new Map();
+const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 
 function nowMs() {
     return Date.now();
@@ -270,6 +287,374 @@ blackFlashWsServer.on('connection', (ws) => {
         if (currentServerId && currentPlayer) {
             blackFlashSockets.delete(blackFlashPlayerKey(currentServerId, currentPlayer));
         }
+    });
+});
+
+function chatClientKey(serverId, playerName) {
+    return `${serverId}:${playerName}`;
+}
+
+const BLOCKED_CHAT_PHRASES = [
+    'fuck',
+    'fuk',
+    'fck',
+    'motherfucker',
+    'mẹ mày',
+    'mẹ mày béo',
+    'me may',
+    'me may beo',
+    'dit me',
+    'địt mẹ',
+    'đụ mẹ',
+    'du me'
+];
+
+function sanitizeChatText(text) {
+    if (typeof text !== 'string') return '';
+    return text.replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+function escapeRegex(text) {
+    return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function censorBlockedChatText(text) {
+    let output = String(text || '');
+    for (const phrase of BLOCKED_CHAT_PHRASES) {
+        const re = new RegExp(escapeRegex(phrase), 'giu');
+        output = output.replace(re, (match) => '#'.repeat(match.length));
+    }
+    return output;
+}
+
+function getServerMemoryHistory(serverId) {
+    if (!chatMemoryHistoryByServer.has(serverId)) {
+        chatMemoryHistoryByServer.set(serverId, []);
+    }
+    return chatMemoryHistoryByServer.get(serverId);
+}
+
+function pushServerMemoryHistory(serverId, message) {
+    const list = getServerMemoryHistory(serverId);
+    list.push(message);
+    if (list.length > MAX_CHAT_HISTORY) {
+        list.splice(0, list.length - MAX_CHAT_HISTORY);
+    }
+}
+
+async function saveServerChatMessage(message) {
+    const payload = {
+        server_id: message.serverId,
+        place_id: message.placeId || null,
+        player_name: message.playerName,
+        display_name: message.displayName,
+        user_id: message.userId || null,
+        text: message.text
+    };
+    const { error } = await supabase.from('chat_history').insert(payload);
+    if (error) {
+        throw error;
+    }
+}
+
+async function pruneServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
+    const { data, error } = await supabase
+        .from('chat_history')
+        .select('id')
+        .eq('server_id', serverId)
+        .order('created_at', { ascending: false })
+        .range(limit, limit + 5000);
+    if (error || !data || data.length === 0) {
+        return;
+    }
+    const ids = data.map((r) => r.id).filter(Boolean);
+    if (ids.length === 0) return;
+    await supabase.from('chat_history').delete().in('id', ids);
+}
+
+async function fetchServerChatHistory(serverId, limit = MAX_CHAT_HISTORY) {
+    const { data, error } = await supabase
+        .from('chat_history')
+        .select('*')
+        .eq('server_id', serverId)
+        .order('created_at', { ascending: false })
+        .limit(limit);
+    if (error) {
+        throw error;
+    }
+    return (data || []).reverse().map((row) => ({
+        id: row.id,
+        channel: 'server',
+        serverId: row.server_id,
+        placeId: row.place_id,
+        playerName: row.player_name,
+        displayName: row.display_name || row.player_name,
+        userId: row.user_id || 0,
+        text: row.text,
+        createdAt: row.created_at || new Date().toISOString()
+    }));
+}
+
+function sendChatWs(ws, payload) {
+    try {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify(payload));
+    } catch (_) {}
+}
+
+function broadcastServerChat(serverId, payload) {
+    for (const client of chatClients) {
+        if (!client || !client.meta || client.meta.serverId !== serverId) continue;
+        sendChatWs(client, payload);
+    }
+}
+
+function broadcastGlobalChannel(payload) {
+    for (const client of chatClients) {
+        if (!client || !client.meta) continue;
+        sendChatWs(client, payload);
+    }
+}
+
+function chatSocketOf(serverId, playerName) {
+    for (const client of chatClients) {
+        if (!client || !client.meta) continue;
+        if (client.meta.serverId === serverId && client.meta.playerName === playerName) {
+            return client;
+        }
+    }
+    return null;
+}
+
+function makePrivateRoomId(serverId, p1, p2) {
+    const sorted = [String(p1 || '').trim(), String(p2 || '').trim()].sort();
+    return `pm_${serverId}_${sorted[0]}_${sorted[1]}`;
+}
+
+function getOrCreatePrivateRoom(serverId, p1, p2) {
+    const id = makePrivateRoomId(serverId, p1, p2);
+    let room = privateChatRooms.get(id);
+    if (!room) {
+        room = {
+            id,
+            serverId,
+            players: [p1, p2],
+            createdAt: Date.now(),
+            updatedAt: Date.now()
+        };
+        privateChatRooms.set(id, room);
+    } else {
+        room.updatedAt = Date.now();
+    }
+    return room;
+}
+
+function cleanupPrivateRooms() {
+    const now = Date.now();
+    for (const [id, room] of privateChatRooms.entries()) {
+        if (!room || now - (room.updatedAt || now) > PRIVATE_ROOM_TTL_MS) {
+            privateChatRooms.delete(id);
+        }
+    }
+}
+
+function isPlayerInRoom(room, playerName) {
+    return !!room && Array.isArray(room.players) && room.players.includes(playerName);
+}
+
+function broadcastPrivateRoom(room, payload) {
+    if (!room || !Array.isArray(room.players)) return;
+    for (const playerName of room.players) {
+        const sock = chatSocketOf(room.serverId, playerName);
+        if (sock) {
+            sendChatWs(sock, payload);
+        }
+    }
+}
+
+robloxChatWsServer.on('connection', (ws) => {
+    ws.meta = null;
+    sendChatWs(ws, { type: 'connected' });
+
+    ws.on('message', async (raw) => {
+        try {
+            cleanupPrivateRooms();
+            const msg = JSON.parse(raw.toString());
+            const type = msg && msg.type;
+
+            if (type === 'register') {
+                const serverId = String(msg.serverId || '').trim();
+                const placeId = Number(msg.placeId || 0) || 0;
+                const playerName = String(msg.playerName || '').trim();
+                const displayNameRaw = String(msg.displayName || '').trim();
+                const displayName = displayNameRaw || playerName;
+                const userId = Number(msg.userId || 0) || 0;
+                if (!serverId || !playerName) {
+                    sendChatWs(ws, { type: 'error', message: 'missing register data' });
+                    return;
+                }
+                ws.meta = {
+                    key: chatClientKey(serverId, playerName),
+                    serverId,
+                    placeId,
+                    playerName,
+                    displayName,
+                    userId
+                };
+                chatClients.add(ws);
+                let history = [];
+                try {
+                    history = await fetchServerChatHistory(serverId, MAX_CHAT_HISTORY);
+                } catch (_) {
+                    history = getServerMemoryHistory(serverId);
+                }
+                sendChatWs(ws, {
+                    type: 'registered',
+                    serverId,
+                    playerName,
+                    history
+                });
+                return;
+            }
+
+            if (!ws.meta) {
+                sendChatWs(ws, { type: 'error', message: 'not registered' });
+                return;
+            }
+
+            if (type === 'chat_message') {
+                const channel = String(msg.channel || 'server').toLowerCase();
+                let text = sanitizeChatText(msg.text);
+                if (!text) {
+                    return;
+                }
+                text = censorBlockedChatText(text);
+                if (!['server', 'en', 'vn'].includes(channel)) {
+                    sendChatWs(ws, { type: 'error', message: 'invalid channel' });
+                    return;
+                }
+
+                const out = {
+                    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    type: 'chat_message',
+                    channel,
+                    serverId: ws.meta.serverId,
+                    placeId: ws.meta.placeId,
+                    playerName: ws.meta.playerName,
+                    displayName: ws.meta.displayName,
+                    userId: ws.meta.userId,
+                    text,
+                    createdAt: new Date().toISOString()
+                };
+
+                if (channel === 'server') {
+                    pushServerMemoryHistory(ws.meta.serverId, out);
+                    try {
+                        await saveServerChatMessage(out);
+                        await pruneServerChatHistory(ws.meta.serverId, MAX_CHAT_HISTORY);
+                    } catch (_) {}
+                    broadcastServerChat(ws.meta.serverId, out);
+                } else {
+                    broadcastGlobalChannel(out);
+                }
+                return;
+            }
+
+            if (type === 'private_open') {
+                const targetName = String(msg.targetName || '').trim();
+                if (!targetName || targetName === ws.meta.playerName) {
+                    sendChatWs(ws, { type: 'error', message: 'invalid target' });
+                    return;
+                }
+                const targetSocket = chatSocketOf(ws.meta.serverId, targetName);
+                if (!targetSocket) {
+                    sendChatWs(ws, { type: 'error', message: 'target offline' });
+                    return;
+                }
+
+                const room = getOrCreatePrivateRoom(ws.meta.serverId, ws.meta.playerName, targetName);
+                const forSender = {
+                    type: 'private_opened',
+                    roomId: room.id,
+                    targetName,
+                    roomName: `PM ${targetName}`
+                };
+                const forTarget = {
+                    type: 'private_opened',
+                    roomId: room.id,
+                    targetName: ws.meta.playerName,
+                    roomName: `PM ${ws.meta.playerName}`
+                };
+                sendChatWs(ws, forSender);
+                sendChatWs(targetSocket, forTarget);
+                return;
+            }
+
+            if (type === 'private_message') {
+                const roomId = String(msg.roomId || '').trim();
+                const room = privateChatRooms.get(roomId);
+                if (!room || room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
+                    sendChatWs(ws, { type: 'error', message: 'private room not found' });
+                    return;
+                }
+                let text = sanitizeChatText(msg.text);
+                if (!text) return;
+                text = censorBlockedChatText(text);
+                room.updatedAt = Date.now();
+                const out = {
+                    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    type: 'chat_message',
+                    channel: 'private',
+                    roomId,
+                    serverId: ws.meta.serverId,
+                    placeId: ws.meta.placeId,
+                    playerName: ws.meta.playerName,
+                    displayName: ws.meta.displayName,
+                    userId: ws.meta.userId,
+                    text,
+                    createdAt: new Date().toISOString()
+                };
+                broadcastPrivateRoom(room, out);
+                return;
+            }
+
+            if (type === 'private_close') {
+                const roomId = String(msg.roomId || '').trim();
+                const room = privateChatRooms.get(roomId);
+                if (!room || room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
+                    return;
+                }
+                privateChatRooms.delete(roomId);
+                broadcastPrivateRoom(room, {
+                    type: 'private_closed',
+                    roomId,
+                    by: ws.meta.playerName
+                });
+                return;
+            }
+
+            if (type === 'ping') {
+                sendChatWs(ws, { type: 'pong', time: Date.now() });
+            }
+        } catch (_) {
+            sendChatWs(ws, { type: 'error', message: 'bad payload' });
+        }
+    });
+
+    ws.on('close', () => {
+        if (ws.meta && ws.meta.serverId && ws.meta.playerName) {
+            for (const [roomId, room] of privateChatRooms.entries()) {
+                if (room.serverId !== ws.meta.serverId) continue;
+                if (!isPlayerInRoom(room, ws.meta.playerName)) continue;
+                privateChatRooms.delete(roomId);
+                broadcastPrivateRoom(room, {
+                    type: 'private_closed',
+                    roomId,
+                    by: ws.meta.playerName
+                });
+            }
+        }
+        chatClients.delete(ws);
     });
 });
 // Middleware
@@ -1388,6 +1773,72 @@ app.post('/api/blackflash/end', (req, res) => {
         return res.status(500).json({ success: false, message: 'Lỗi server nội bộ' });
     }
 });
+app.post('/api/chat/server/send', async (req, res) => {
+    try {
+        const serverId = String(req.body?.serverId || '').trim();
+        const placeId = Number(req.body?.placeId || 0) || 0;
+        const playerName = String(req.body?.playerName || '').trim();
+        const displayNameRaw = String(req.body?.displayName || '').trim();
+        const displayName = displayNameRaw || playerName;
+        const userId = Number(req.body?.userId || 0) || 0;
+        let text = sanitizeChatText(req.body?.text);
+
+        if (!serverId || !playerName || !text) {
+            return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
+        }
+        text = censorBlockedChatText(text);
+
+        const out = {
+            id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            type: 'chat_message',
+            channel: 'server',
+            serverId,
+            placeId,
+            playerName,
+            displayName,
+            userId,
+            text,
+            createdAt: new Date().toISOString()
+        };
+
+        pushServerMemoryHistory(serverId, out);
+        try {
+            await saveServerChatMessage(out);
+            await pruneServerChatHistory(serverId, MAX_CHAT_HISTORY);
+        } catch (_) {}
+        broadcastServerChat(serverId, out);
+        return res.json({ success: true, data: out });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+app.get('/api/chat/server/history', async (req, res) => {
+    try {
+        const serverId = String(req.query?.serverId || '').trim();
+        const limit = Math.min(Math.max(Number(req.query?.limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
+        if (!serverId) {
+            return res.status(400).json({ success: false, message: 'missing serverId' });
+        }
+
+        let history = [];
+        try {
+            history = await fetchServerChatHistory(serverId, limit);
+        } catch (_) {
+            const memoryHistory = getServerMemoryHistory(serverId);
+            history = memoryHistory.slice(Math.max(0, memoryHistory.length - limit));
+        }
+
+        return res.json({
+            success: true,
+            data: {
+                serverId,
+                history
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
@@ -1483,7 +1934,10 @@ app.get('/', (req, res) => {
             verifyKey: 'POST /verify-key',
             keyInfo: 'GET /key-info/:key',
             checkTimeLeft: 'POST /check-time-left',
-            adminLogin: 'POST /admin/login'
+            adminLogin: 'POST /admin/login',
+            chatHistory: 'GET /api/chat/server/history?serverId=...',
+            chatSend: 'POST /api/chat/server/send',
+            chatWs: '/chat-ws'
         }
     });
 });
