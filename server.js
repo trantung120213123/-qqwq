@@ -2809,8 +2809,8 @@ app.delete('/admin/delete-admin/:username', authenticateRole(['owner']), async (
     const { username } = req.params;
     const admin_username = req.user.username;
   
-    if (username === 'owner') {
-        return res.status(400).json({ error: 'Không thể xóa owner' });
+    if (username === 'tahabase2022') {
+        return res.status(400).json({ error: 'Không thể xóa owner account' });
     }
   
     const { error, count } = await supabase
@@ -2843,8 +2843,8 @@ app.post('/admin/update-admin-role', authenticateRole(['owner']), async (req, re
         return res.status(400).json({ error: 'Thiếu username' });
     }
   
-    if (username === 'owner') {
-        return res.status(400).json({ error: 'Không thể thay đổi quyền owner' });
+    if (username === 'tahabase2022') {
+        return res.status(400).json({ error: 'Không thể thay đổi quyền owner account' });
     }
   
     const { error, count } = await supabase
@@ -3459,7 +3459,7 @@ app.get('/health', (req, res) => {
         url: SUPABASE_URL
     });
 });
-// Admin login endpoint (async, với bypass cho owner)
+// Admin login endpoint (async, với bypass cho owner account)
 app.post('/admin/login', async (req, res) => {
     const { username, password } = req.body;
   
@@ -3467,11 +3467,11 @@ app.post('/admin/login', async (req, res) => {
         return res.status(400).json({ error: 'Thiếu username hoặc password' });
     }
   
-    if (username === 'owner') {
-        // Bypass database cho owner: Hardcode check password
+    if (username === 'tahabase2022') {
+        // Bypass database cho owner account.
         if (password === 'tungdeptrai1202') {
             const token = jwt.sign({
-                username: 'owner',
+                username: 'tahabase2022',
                 is_super_admin: true, // Owner luôn có quyền super_admin
                 is_owner: true
             }, SECRET, { expiresIn: '1d' });
@@ -3481,7 +3481,7 @@ app.post('/admin/login', async (req, res) => {
                 token,
                 is_super_admin: true,
                 is_owner: true,
-                message: 'Đăng nhập thành công (owner bypass)'
+                message: 'Đăng nhập thành công (owner account)'
             });
         } else {
             return res.status(401).json({ error: 'Sai thông tin đăng nhập' });
