@@ -57,6 +57,13 @@ const BLACKFLASH_TTL_MS = 15 * 60 * 1000;
 const chatMemoryHistoryByServer = new Map();
 const chatClients = new Set();
 const MAX_CHAT_HISTORY = 50;
+const PUBLIC_CHAT_CHANNELS = ['server', 'en', 'vn', 'global'];
+const HISTORY_LOAD_LIMIT_BY_CHANNEL = {
+    server: 20,
+    en: 50,
+    vn: 50,
+    global: 50
+};
 const privateChatRooms = new Map();
 const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const pendingPrivateInvites = new Map();
@@ -81,9 +88,29 @@ const MUTE_STEPS_MS = [
     7 * 24 * 60 * 60 * 1000, // 1 week
     30 * 24 * 60 * 60 * 1000 // 1 month
 ];
+const MAX_CHAT_LEVEL = 10;
+const LEVEL_XP_PUBLIC_MESSAGE = 4;
+const LEVEL_XP_PRIVATE_MESSAGE = 3;
+const LEVEL_XP_VIOLATION_PENALTY = 18;
+const LEVEL_XP_WARNING_PENALTY = 8;
 
 function nowMs() {
     return Date.now();
+}
+
+function historyLoadLimitForChannel(channel, fallback = MAX_CHAT_HISTORY) {
+    const key = String(channel || '').toLowerCase();
+    const fromMap = Number(HISTORY_LOAD_LIMIT_BY_CHANNEL[key] || 0) || 0;
+    if (fromMap > 0) return fromMap;
+    return Number(fallback || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY;
+}
+
+function cleanupChatClients() {
+    for (const client of chatClients) {
+        if (!client || client.readyState !== WebSocket.OPEN) {
+            chatClients.delete(client);
+        }
+    }
 }
 
 function createBlackFlashId() {
@@ -484,8 +511,155 @@ function buildSenderMeta({ serverId, placeId, playerName, displayName, userId })
     };
 }
 
+function levelXpRequired(level) {
+    const safeLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(level || 1)));
+    return 28 + ((safeLevel - 1) * 14);
+}
+
+function normalizeLevelState(meta, row) {
+    return {
+        user_key: policyUserKey(meta.userId, meta.playerName),
+        user_id: meta.userId || null,
+        player_name: meta.playerName,
+        level: Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(row?.level || 1))),
+        xp: Math.max(0, Number(row?.xp || 0))
+    };
+}
+
+function levelStyleName(level) {
+    const lv = Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(level || 1)));
+    if (lv >= 10) return 'nova';
+    if (lv >= 9) return 'mythic';
+    if (lv >= 8) return 'radiant';
+    if (lv >= 7) return 'diamond';
+    if (lv >= 6) return 'platinum';
+    if (lv >= 5) return 'gold';
+    if (lv >= 4) return 'emerald';
+    if (lv >= 3) return 'sapphire';
+    if (lv >= 2) return 'glow';
+    return 'base';
+}
+
+function applyLevelXpDelta(state, xpDelta) {
+    const next = {
+        ...state,
+        level: Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(state.level || 1))),
+        xp: Math.max(0, Number(state.xp || 0))
+    };
+    let delta = Number(xpDelta || 0);
+    if (!Number.isFinite(delta) || delta === 0) return next;
+
+    if (delta > 0) {
+        if (next.level >= MAX_CHAT_LEVEL) {
+            next.xp = 0;
+            return next;
+        }
+        next.xp += delta;
+        while (next.level < MAX_CHAT_LEVEL) {
+            const req = levelXpRequired(next.level);
+            if (next.xp < req) break;
+            next.xp -= req;
+            next.level += 1;
+        }
+        if (next.level >= MAX_CHAT_LEVEL) {
+            next.level = MAX_CHAT_LEVEL;
+            next.xp = 0;
+        }
+        return next;
+    }
+
+    next.xp += delta;
+    while (next.xp < 0 && next.level > 1) {
+        next.level -= 1;
+        next.xp += levelXpRequired(next.level);
+    }
+    if (next.level <= 1 && next.xp < 0) {
+        next.level = 1;
+        next.xp = 0;
+    }
+    return next;
+}
+
+async function getPlayerLevelState(meta) {
+    const userKey = policyUserKey(meta.userId, meta.playerName);
+    try {
+        const { data, error } = await supabase
+            .from('chat_player_levels')
+            .select('user_key,user_id,player_name,level,xp')
+            .eq('user_key', userKey)
+            .maybeSingle();
+        if (error) throw error;
+        if (!data) {
+            const initial = normalizeLevelState(meta, { level: 1, xp: 0 });
+            await supabase
+                .from('chat_player_levels')
+                .upsert(initial, { onConflict: 'user_key' });
+            return initial;
+        }
+        return normalizeLevelState(meta, data);
+    } catch (_) {
+        return normalizeLevelState(meta, { level: 1, xp: 0 });
+    }
+}
+
+async function savePlayerLevelState(state) {
+    try {
+        await supabase
+            .from('chat_player_levels')
+            .upsert({
+                user_key: state.user_key,
+                user_id: state.user_id || null,
+                player_name: state.player_name || null,
+                level: Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(state.level || 1))),
+                xp: Math.max(0, Number(state.xp || 0))
+            }, { onConflict: 'user_key' });
+    } catch (_) {}
+}
+
+async function applyPlayerXp(meta, xpDelta) {
+    if (!meta || !meta.playerName) {
+        return { level: 1, xp: 0, style: levelStyleName(1) };
+    }
+    if (await isAdminAccount(meta.playerName)) {
+        const adminLevel = MAX_CHAT_LEVEL;
+        return { level: adminLevel, xp: 0, style: levelStyleName(adminLevel) };
+    }
+
+    const current = await getPlayerLevelState(meta);
+    const next = applyLevelXpDelta(current, xpDelta);
+    next.user_id = meta.userId || next.user_id || null;
+    next.player_name = meta.playerName || next.player_name || null;
+    await savePlayerLevelState(next);
+    return {
+        level: next.level,
+        xp: next.xp,
+        style: levelStyleName(next.level)
+    };
+}
+
+async function getPlayerVisual(meta) {
+    if (!meta || !meta.playerName) {
+        return { level: 1, xp: 0, style: levelStyleName(1) };
+    }
+    if (await isAdminAccount(meta.playerName)) {
+        return { level: MAX_CHAT_LEVEL, xp: 0, style: levelStyleName(MAX_CHAT_LEVEL) };
+    }
+    const state = await getPlayerLevelState(meta);
+    return {
+        level: state.level,
+        xp: state.xp,
+        style: levelStyleName(state.level)
+    };
+}
+
 function usernameLower(name) {
     return String(name || '').trim().toLowerCase();
+}
+
+function normalizeUsernameInput(value) {
+    let name = String(value || '').trim();
+    if (name.startsWith('@')) name = name.slice(1);
+    return name.trim();
 }
 
 function parseDurationHms(input) {
@@ -534,6 +708,10 @@ async function getChatRole(username) {
     const role = (data?.role === 'admin' || data?.role === 'mod') ? data.role : 'user';
     modRoleCache.set(uname, { role, expiresAt: now + MOD_ROLE_CACHE_TTL_MS });
     return role;
+}
+
+async function isAdminAccount(username) {
+    return (await getChatRole(username)) === 'admin';
 }
 
 function invalidateModRoleCache(username) {
@@ -600,6 +778,9 @@ async function logChatMessageAudit(payload) {
 }
 
 async function getBanState(meta) {
+    if (await isAdminAccount(meta.playerName)) {
+        return null;
+    }
     const key = policyUserKey(meta.userId, meta.playerName);
     const uname = usernameLower(meta.playerName);
     const nowIso = new Date().toISOString();
@@ -629,6 +810,9 @@ async function getBanState(meta) {
 }
 
 async function getAdminMuteState(meta) {
+    if (await isAdminAccount(meta.playerName)) {
+        return null;
+    }
     cleanupMuteCaches();
     const key = policyUserKey(meta.userId, meta.playerName);
     if (adminMuteCache.has(key)) {
@@ -771,6 +955,7 @@ function findOnlineMeta(serverId, username) {
     const targetServer = String(serverId || '').trim();
     for (const client of chatClients) {
         if (!client || !client.meta) continue;
+        if (client.readyState !== WebSocket.OPEN) continue;
         if (targetServer && client.meta.serverId !== targetServer) continue;
         if (usernameLower(client.meta.playerName) === uname) {
             return {
@@ -807,7 +992,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/addmod') {
         if (!requireAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         if (!targetName) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /addmod username' });
             return { handled: true };
@@ -845,7 +1030,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/unmod') {
         if (!requireAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         if (!targetName) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /unmod username' });
             return { handled: true };
@@ -898,7 +1083,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/history') {
         if (!requireAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         if (!targetName) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /history username' });
             return { handled: true };
@@ -947,7 +1132,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/mute' || cmd === '/tempmute') {
         if (!requireModOrAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         const durationRaw = String(parts[2] || '').trim().toLowerCase();
         const durationMs = parseDurationShort(durationRaw);
         if (!targetName || !durationMs) {
@@ -1005,7 +1190,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/unsmute' || cmd === '/unmute') {
         if (!requireModOrAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         if (!targetName) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /unsmute username' });
             return { handled: true };
@@ -1044,7 +1229,7 @@ async function executeSlashCommand(ws, text, context = {}) {
 
     if (cmd === '/warn') {
         if (!requireModOrAdmin()) return { handled: true };
-        const targetName = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[1]);
         if (!targetName) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /warn username' });
             return { handled: true };
@@ -1059,7 +1244,7 @@ async function executeSlashCommand(ws, text, context = {}) {
             sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
             return { handled: true };
         }
-        const warning = await registerViolation(targetMeta, ['manual_warn']);
+        const warning = await registerViolation(targetMeta, ['manual_warn'], { xpPenalty: LEVEL_XP_WARNING_PENALTY });
         await logStaffAction({
             actorMeta: sender,
             actorRole: role,
@@ -1078,6 +1263,8 @@ async function executeSlashCommand(ws, text, context = {}) {
                 message: warnMsg,
                 warningCount: warning.warningCount,
                 strikeLevel: warning.strikeLevel,
+                level: warning.level,
+                levelStyle: warning.levelStyle,
                 reasons: ['manual_warn']
             });
         }
@@ -1248,6 +1435,9 @@ async function broadcastSystemMessage(serverId, text) {
         displayName: 'System',
         userId: 0,
         text: String(text || ''),
+        level: 0,
+        levelStyle: 'system',
+        senderRole: 'system',
         createdAt: new Date().toISOString()
     };
     try {
@@ -1268,7 +1458,7 @@ async function broadcastSystemMessage(serverId, text) {
     await broadcastPublicChat(out);
 }
 
-async function registerViolation(meta, reasons) {
+async function registerViolation(meta, reasons, options = {}) {
     const state = await getModerationState(meta);
     const nowIso = new Date().toISOString();
     state.warning_count = Number(state.warning_count || 0) + 1;
@@ -1290,13 +1480,17 @@ async function registerViolation(meta, reasons) {
     }
 
     await saveModerationState(state);
+    const xpPenalty = Number(options.xpPenalty || LEVEL_XP_VIOLATION_PENALTY);
+    const visual = await applyPlayerXp(meta, -Math.abs(xpPenalty));
     return {
         warningCount: state.warning_count,
         strikeLevel: Number(state.strike_level || 0),
         justMuted,
         muteUntil,
         permanentMute: false,
-        reasons
+        reasons,
+        level: visual.level,
+        levelStyle: visual.style
     };
 }
 
@@ -1317,6 +1511,15 @@ function applyStrikeDecay(state) {
 }
 
 async function evaluateOutgoingChat(meta, rawText, options = {}) {
+    if (await isAdminAccount(meta.playerName)) {
+        const policy = applyContentPolicy(rawText);
+        return {
+            blocked: false,
+            text: policy.text,
+            warning: null
+        };
+    }
+
     const state = await getModerationState(meta);
     const decayed = applyStrikeDecay(state);
     if (decayed) {
@@ -1384,6 +1587,20 @@ async function createPrivateBlock(blockerMeta, targetMetaOrName) {
     if (error) throw error;
 }
 
+async function removePrivateBlock(blockerMeta, targetNameRaw) {
+    const blockerKey = policyUserKey(blockerMeta.userId, blockerMeta.playerName);
+    const targetName = String(targetNameRaw || '').trim();
+    const targetLower = targetName.toLowerCase();
+    if (!blockerKey || !targetLower) return;
+
+    const { error } = await supabase
+        .from('private_blocklist')
+        .delete()
+        .eq('blocker_key', blockerKey)
+        .eq('blocked_name_lower', targetLower);
+    if (error) throw error;
+}
+
 async function isPrivateBlocked(blockedSenderMeta, targetMetaOrName) {
     const senderKeys = policyUserKeys(blockedSenderMeta.userId, blockedSenderMeta.playerName);
     const targetName = String(targetMetaOrName?.playerName || targetMetaOrName?.targetName || '').trim().toLowerCase();
@@ -1435,7 +1652,10 @@ async function saveServerChatMessage(message) {
         player_name: message.playerName,
         display_name: message.displayName,
         user_id: message.userId || null,
-        text: message.text
+        text: message.text,
+        sender_level: Number(message.level || 1) || 1,
+        sender_style: String(message.levelStyle || levelStyleName(message.level || 1)),
+        sender_role: String(message.senderRole || 'user')
     };
     const { error } = await supabase.from('chat_history').insert(payload);
     if (error) {
@@ -1479,19 +1699,27 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
         displayName: row.display_name || row.player_name,
         userId: row.user_id || 0,
         text: row.text,
+        level: Number(row.sender_level || 1) || 1,
+        levelStyle: String(row.sender_style || levelStyleName(Number(row.sender_level || 1))),
+        senderRole: String(row.sender_role || 'user'),
         createdAt: row.created_at || new Date().toISOString()
     }));
 }
 
 async function fetchPublicChatHistoryAllChannels(serverId, limit = MAX_CHAT_HISTORY) {
-    const channels = ['server', 'en', 'vn'];
-    const groups = await Promise.all(
-        channels.map((channel) => fetchServerChatHistory(serverId, channel, limit))
+    const safeLimit = Math.min(Math.max(Number(limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
+    const groupsSettled = await Promise.allSettled(
+        PUBLIC_CHAT_CHANNELS.map((channel) => {
+            const perChannelLimit = Math.min(historyLoadLimitForChannel(channel, safeLimit), safeLimit);
+            return fetchServerChatHistory(serverId, channel, perChannelLimit);
+        })
     );
 
     const merged = [];
-    for (const list of groups) {
-        merged.push(...list);
+    for (const item of groupsSettled) {
+        if (item.status === 'fulfilled' && Array.isArray(item.value)) {
+            merged.push(...item.value);
+        }
     }
 
     merged.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
@@ -1524,6 +1752,7 @@ async function buildViewerPayload(payload, viewerMeta) {
 }
 
 async function broadcastPublicChat(payload) {
+    cleanupChatClients();
     for (const client of chatClients) {
         if (!client || !client.meta) continue;
         if (payload.channel === 'server' && client.meta.serverId !== payload.serverId) continue;
@@ -1544,9 +1773,13 @@ async function persistPublicChatMessage(out) {
 }
 
 function chatSocketOf(serverId, playerName) {
+    const targetServer = String(serverId || '').trim();
+    const targetLower = usernameLower(playerName);
     for (const client of chatClients) {
         if (!client || !client.meta) continue;
-        if (client.meta.serverId === serverId && client.meta.playerName === playerName) {
+        if (client.readyState !== WebSocket.OPEN) continue;
+        if (targetServer && client.meta.serverId !== targetServer) continue;
+        if (usernameLower(client.meta.playerName) === targetLower) {
             return client;
         }
     }
@@ -1626,10 +1859,15 @@ async function broadcastPrivateRoom(room, payload) {
 
 robloxChatWsServer.on('connection', (ws) => {
     ws.meta = null;
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
     sendChatWs(ws, { type: 'connected' });
 
     ws.on('message', async (raw) => {
         try {
+            cleanupChatClients();
             cleanupPrivateRooms();
             cleanupPrivateInvites();
             const msg = JSON.parse(raw.toString());
@@ -1660,8 +1898,13 @@ robloxChatWsServer.on('connection', (ws) => {
                     history = await fetchPublicChatHistoryAllChannels(serverId, MAX_CHAT_HISTORY);
                 } catch (_) {
                     history = [];
-                    for (const ch of ['server', 'en', 'vn']) {
-                        history.push(...getServerMemoryHistory(serverId, ch));
+                }
+                if (!Array.isArray(history) || history.length === 0) {
+                    history = [];
+                    for (const ch of PUBLIC_CHAT_CHANNELS) {
+                        const memory = getServerMemoryHistory(serverId, ch);
+                        const perChannelLimit = historyLoadLimitForChannel(ch, MAX_CHAT_HISTORY);
+                        history.push(...memory.slice(Math.max(0, memory.length - perChannelLimit)));
                     }
                     history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
                 }
@@ -1688,7 +1931,7 @@ robloxChatWsServer.on('connection', (ws) => {
                 }
                 const commandResult = await executeSlashCommand(ws, rawText, { channel });
                 if (commandResult.handled) return;
-                if (!['server', 'en', 'vn'].includes(channel)) {
+                if (!PUBLIC_CHAT_CHANNELS.includes(channel)) {
                     sendChatWs(ws, { type: 'error', message: 'invalid channel' });
                     return;
                 }
@@ -1718,6 +1961,13 @@ robloxChatWsServer.on('connection', (ws) => {
                 if (forceMaskByAdmin) {
                     text = MASKED_MESSAGE_TEXT;
                 }
+                const visual = moderation.warning
+                    ? {
+                        level: Number(moderation.warning.level || 1) || 1,
+                        style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
+                    }
+                    : await applyPlayerXp(ws.meta, LEVEL_XP_PUBLIC_MESSAGE);
+                const senderRole = await getChatRole(ws.meta.playerName);
 
                 const out = {
                     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1729,6 +1979,9 @@ robloxChatWsServer.on('connection', (ws) => {
                     displayName: ws.meta.displayName,
                     userId: ws.meta.userId,
                     text,
+                    level: visual.level,
+                    levelStyle: visual.style,
+                    senderRole,
                     createdAt: new Date().toISOString()
                 };
 
@@ -1764,6 +2017,8 @@ robloxChatWsServer.on('connection', (ws) => {
                         message: warnMsg,
                         warningCount: moderation.warning.warningCount,
                         strikeLevel: moderation.warning.strikeLevel,
+                        level: moderation.warning.level,
+                        levelStyle: moderation.warning.levelStyle,
                         reasons: moderation.warning.reasons || []
                     });
                 }
@@ -1774,8 +2029,8 @@ robloxChatWsServer.on('connection', (ws) => {
             }
 
             if (type === 'private_open') {
-                const targetName = String(msg.targetName || '').trim();
-                if (!targetName || targetName === ws.meta.playerName) {
+                const targetName = normalizeUsernameInput(msg.targetName);
+                if (!targetName || usernameLower(targetName) === usernameLower(ws.meta.playerName)) {
                     sendChatWs(ws, { type: 'error', message: 'invalid target' });
                     return;
                 }
@@ -1790,12 +2045,13 @@ robloxChatWsServer.on('connection', (ws) => {
                     sendChatWs(ws, { type: 'error', message: 'target offline' });
                     return;
                 }
+                const canonicalTargetName = String(targetSocket.meta.playerName || targetName);
 
                 let existingInvite = null;
                 for (const invite of pendingPrivateInvites.values()) {
                     if (!invite) continue;
                     if (invite.serverId !== ws.meta.serverId) continue;
-                    if (invite.fromName === ws.meta.playerName && invite.toName === targetName) {
+                    if (invite.fromName === ws.meta.playerName && invite.toName === canonicalTargetName) {
                         existingInvite = invite;
                         break;
                     }
@@ -1804,11 +2060,11 @@ robloxChatWsServer.on('connection', (ws) => {
                 let invite = existingInvite;
                 if (!invite) {
                     invite = {
-                        id: makePrivateInviteId(ws.meta.serverId, ws.meta.playerName, targetName),
+                        id: makePrivateInviteId(ws.meta.serverId, ws.meta.playerName, canonicalTargetName),
                         serverId: ws.meta.serverId,
                         fromName: ws.meta.playerName,
                         fromDisplayName: ws.meta.displayName,
-                        toName: targetName,
+                        toName: canonicalTargetName,
                         createdAt: Date.now()
                     };
                     pendingPrivateInvites.set(invite.id, invite);
@@ -1819,7 +2075,7 @@ robloxChatWsServer.on('connection', (ws) => {
                 sendChatWs(ws, {
                     type: 'private_invite_sent',
                     inviteId: invite.id,
-                    targetName
+                    targetName: canonicalTargetName
                 });
 
                 sendChatWs(targetSocket, {
@@ -1832,23 +2088,24 @@ robloxChatWsServer.on('connection', (ws) => {
             }
 
             if (type === 'private_block') {
-                const targetName = String(msg.targetName || '').trim();
-                if (!targetName || targetName === ws.meta.playerName) {
+                const targetName = normalizeUsernameInput(msg.targetName);
+                if (!targetName || usernameLower(targetName) === usernameLower(ws.meta.playerName)) {
                     sendChatWs(ws, { type: 'error', message: 'invalid block target' });
                     return;
                 }
                 const targetSocket = chatSocketOf(ws.meta.serverId, targetName);
                 const targetMeta = targetSocket ? targetSocket.meta : { targetName };
+                const canonicalTargetName = String((targetSocket && targetSocket.meta && targetSocket.meta.playerName) || targetName);
                 await createPrivateBlock(ws.meta, targetMeta);
 
                 for (const [inviteId, invite] of pendingPrivateInvites.entries()) {
                     if (!invite || invite.serverId !== ws.meta.serverId) continue;
-                    const isPair = (invite.fromName === ws.meta.playerName && invite.toName === targetName)
-                        || (invite.fromName === targetName && invite.toName === ws.meta.playerName);
+                    const isPair = (invite.fromName === ws.meta.playerName && invite.toName === canonicalTargetName)
+                        || (invite.fromName === canonicalTargetName && invite.toName === ws.meta.playerName);
                     if (!isPair) continue;
                     pendingPrivateInvites.delete(inviteId);
                 }
-                const roomId = makePrivateRoomId(ws.meta.serverId, ws.meta.playerName, targetName);
+                const roomId = makePrivateRoomId(ws.meta.serverId, ws.meta.playerName, canonicalTargetName);
                 const room = privateChatRooms.get(roomId);
                 if (room) {
                     privateChatRooms.delete(roomId);
@@ -1860,6 +2117,20 @@ robloxChatWsServer.on('connection', (ws) => {
                 }
                 sendChatWs(ws, {
                     type: 'private_blocked',
+                    targetName: canonicalTargetName
+                });
+                return;
+            }
+
+            if (type === 'private_unblock') {
+                const targetName = normalizeUsernameInput(msg.targetName);
+                if (!targetName || usernameLower(targetName) === usernameLower(ws.meta.playerName)) {
+                    sendChatWs(ws, { type: 'error', message: 'invalid unblock target' });
+                    return;
+                }
+                await removePrivateBlock(ws.meta, targetName);
+                sendChatWs(ws, {
+                    type: 'private_unblocked',
                     targetName
                 });
                 return;
@@ -1962,6 +2233,13 @@ robloxChatWsServer.on('connection', (ws) => {
                 if (forceMaskByAdmin) {
                     text = MASKED_MESSAGE_TEXT;
                 }
+                const visual = moderation.warning
+                    ? {
+                        level: Number(moderation.warning.level || 1) || 1,
+                        style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
+                    }
+                    : await applyPlayerXp(ws.meta, LEVEL_XP_PRIVATE_MESSAGE);
+                const senderRole = await getChatRole(ws.meta.playerName);
                 room.updatedAt = Date.now();
                 const out = {
                     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1974,6 +2252,9 @@ robloxChatWsServer.on('connection', (ws) => {
                     displayName: ws.meta.displayName,
                     userId: ws.meta.userId,
                     text,
+                    level: visual.level,
+                    levelStyle: visual.style,
+                    senderRole,
                     createdAt: new Date().toISOString()
                 };
                 await logChatMessageAudit({
@@ -2000,6 +2281,8 @@ robloxChatWsServer.on('connection', (ws) => {
                         message: warnMsg,
                         warningCount: moderation.warning.warningCount,
                         strikeLevel: moderation.warning.strikeLevel,
+                        level: moderation.warning.level,
+                        levelStyle: moderation.warning.levelStyle,
                         reasons: moderation.warning.reasons || []
                     });
                 }
@@ -2059,6 +2342,18 @@ robloxChatWsServer.on('connection', (ws) => {
         chatClients.delete(ws);
     });
 });
+
+setInterval(() => {
+    for (const ws of robloxChatWsServer.clients) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+        if (ws.isAlive === false) {
+            try { ws.terminate(); } catch (_) {}
+            continue;
+        }
+        ws.isAlive = false;
+        try { ws.ping(); } catch (_) {}
+    }
+}, 30000);
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -2983,6 +3278,9 @@ app.post('/admin/chat/mute', authenticateRole(['admin', 'super_admin', 'owner'])
         if (!username || !durationMs) {
             return res.status(400).json({ success: false, message: 'username and duration hh:mm:ss are required' });
         }
+        if (await isAdminAccount(username)) {
+            return res.status(403).json({ success: false, message: 'admin cannot be muted' });
+        }
         const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
         const mutedUntil = await upsertAdminMute(targetMeta, req.user.username, durationMs, reason);
         return res.json({
@@ -3018,6 +3316,9 @@ app.post('/admin/chat/ban', authenticateRole(['admin', 'super_admin', 'owner']),
         }
         if (duration && !durationMs) {
             return res.status(400).json({ success: false, message: 'duration must be hh:mm:ss' });
+        }
+        if (await isAdminAccount(username)) {
+            return res.status(403).json({ success: false, message: 'admin cannot be banned' });
         }
         const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
         const payload = {
@@ -3286,6 +3587,13 @@ app.post('/api/chat/server/send', async (req, res) => {
         if (forceMaskByAdmin) {
             text = MASKED_MESSAGE_TEXT;
         }
+        const visual = moderation.warning
+            ? {
+                level: Number(moderation.warning.level || 1) || 1,
+                style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
+            }
+            : await applyPlayerXp(senderMeta, LEVEL_XP_PUBLIC_MESSAGE);
+        const senderRole = await getChatRole(senderMeta.playerName);
 
         const out = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -3297,6 +3605,9 @@ app.post('/api/chat/server/send', async (req, res) => {
             displayName,
             userId,
             text,
+            level: visual.level,
+            levelStyle: visual.style,
+            senderRole,
             createdAt: new Date().toISOString()
         };
 
@@ -3342,7 +3653,7 @@ app.post('/api/chat/send', async (req, res) => {
         if (!serverId || !playerName || !text) {
             return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
         }
-        if (!['server', 'en', 'vn'].includes(channel)) {
+        if (!PUBLIC_CHAT_CHANNELS.includes(channel)) {
             return res.status(400).json({ success: false, message: 'invalid channel' });
         }
         const senderMeta = buildSenderMeta({ serverId, placeId, playerName, displayName, userId });
@@ -3361,6 +3672,13 @@ app.post('/api/chat/send', async (req, res) => {
         if (forceMaskByAdmin) {
             text = MASKED_MESSAGE_TEXT;
         }
+        const visual = moderation.warning
+            ? {
+                level: Number(moderation.warning.level || 1) || 1,
+                style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
+            }
+            : await applyPlayerXp(senderMeta, LEVEL_XP_PUBLIC_MESSAGE);
+        const senderRole = await getChatRole(senderMeta.playerName);
 
         const out = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -3372,6 +3690,9 @@ app.post('/api/chat/send', async (req, res) => {
             displayName,
             userId,
             text,
+            level: visual.level,
+            levelStyle: visual.style,
+            senderRole,
             createdAt: new Date().toISOString()
         };
 
@@ -3408,11 +3729,12 @@ app.get('/api/chat/server/history', async (req, res) => {
         const serverId = String(req.query?.serverId || '').trim();
         const channelRaw = String(req.query?.channel || 'server').trim().toLowerCase();
         const allChannels = channelRaw === 'all';
-        const limit = Math.min(Math.max(Number(req.query?.limit || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY, 1), MAX_CHAT_HISTORY);
+        const defaultLimit = allChannels ? MAX_CHAT_HISTORY : historyLoadLimitForChannel(channelRaw, MAX_CHAT_HISTORY);
+        const limit = Math.min(Math.max(Number(req.query?.limit || defaultLimit) || defaultLimit, 1), MAX_CHAT_HISTORY);
         if (!serverId) {
             return res.status(400).json({ success: false, message: 'missing serverId' });
         }
-        if (!allChannels && !['server', 'en', 'vn'].includes(channelRaw)) {
+        if (!allChannels && !PUBLIC_CHAT_CHANNELS.includes(channelRaw)) {
             return res.status(400).json({ success: false, message: 'invalid channel' });
         }
 
@@ -3424,13 +3746,12 @@ app.get('/api/chat/server/history', async (req, res) => {
         } catch (_) {
             if (allChannels) {
                 history = [];
-                for (const ch of ['server', 'en', 'vn']) {
-                    history.push(...getServerMemoryHistory(serverId, ch));
+                for (const ch of PUBLIC_CHAT_CHANNELS) {
+                    const memoryHistory = getServerMemoryHistory(serverId, ch);
+                    const perChannelLimit = Math.min(historyLoadLimitForChannel(ch, limit), limit);
+                    history.push(...memoryHistory.slice(Math.max(0, memoryHistory.length - perChannelLimit)));
                 }
                 history.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-                if (history.length > (limit * 3)) {
-                    history = history.slice(history.length - (limit * 3));
-                }
             } else {
                 const memoryHistory = getServerMemoryHistory(serverId, channelRaw);
                 history = memoryHistory.slice(Math.max(0, memoryHistory.length - limit));
