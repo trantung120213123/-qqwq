@@ -7,6 +7,7 @@ const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
+const WebSocket = require('ws');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = 'tungdeptrai1202';
@@ -27,8 +28,19 @@ const io = new Server(server, {
         methods: ['GET', 'POST']
     }
 });
+const blackFlashWsServer = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+    if (!request.url || !request.url.startsWith('/blackflash-ws')) {
+        return;
+    }
+    blackFlashWsServer.handleUpgrade(request, socket, head, (ws) => {
+        blackFlashWsServer.emit('connection', ws, request);
+    });
+});
 
 const blackFlashSessions = new Map();
+const blackFlashSockets = new Map();
 const BLACKFLASH_TTL_MS = 15 * 60 * 1000;
 
 function nowMs() {
@@ -47,6 +59,219 @@ function cleanupBlackFlashSessions() {
         }
     }
 }
+function blackFlashPlayerKey(serverId, player) {
+    return `${serverId}:${player}`;
+}
+
+function sendBlackFlashWs(ws, payload) {
+    try {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify(payload));
+    } catch (_) {}
+}
+
+function notifyBlackFlashPlayer(serverId, player, payload) {
+    const key = blackFlashPlayerKey(serverId, player);
+    const ws = blackFlashSockets.get(key);
+    if (ws) {
+        sendBlackFlashWs(ws, payload);
+    }
+}
+
+function broadcastBlackFlashSession(session, payload) {
+    if (!session) return;
+    notifyBlackFlashPlayer(session.serverId, session.sender, payload);
+    notifyBlackFlashPlayer(session.serverId, session.receiver, payload);
+}
+
+blackFlashWsServer.on('connection', (ws) => {
+    let currentServerId = null;
+    let currentPlayer = null;
+
+    sendBlackFlashWs(ws, { type: 'connected' });
+
+    ws.on('message', (raw) => {
+        try {
+            cleanupBlackFlashSessions();
+            const msg = JSON.parse(raw.toString());
+            const type = msg && msg.type;
+
+            if (type === 'register') {
+                const { serverId, player } = msg;
+                if (!serverId || !player) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'missing register data' });
+                    return;
+                }
+                currentServerId = serverId;
+                currentPlayer = player;
+                blackFlashSockets.set(blackFlashPlayerKey(serverId, player), ws);
+                sendBlackFlashWs(ws, { type: 'registered', serverId, player });
+                return;
+            }
+
+            if (!currentServerId || !currentPlayer) {
+                sendBlackFlashWs(ws, { type: 'error', message: 'not registered' });
+                return;
+            }
+
+            if (type === 'invite') {
+                const { sender, receiver, placeId } = msg;
+                if (!sender || !receiver || sender === receiver) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'invalid invite' });
+                    return;
+                }
+
+                let session = null;
+                for (const item of blackFlashSessions.values()) {
+                    const samePair = item.serverId === currentServerId &&
+                        ((item.sender === sender && item.receiver === receiver) ||
+                        (item.sender === receiver && item.receiver === sender));
+                    const active = ['pending', 'accepted', 'started'].includes(item.status);
+                    if (samePair && active) {
+                        session = item;
+                        break;
+                    }
+                }
+                if (!session) {
+                    const id = createBlackFlashId();
+                    session = {
+                        id,
+                        sender,
+                        receiver,
+                        serverId: currentServerId,
+                        placeId: placeId || null,
+                        status: 'pending',
+                        senderReady: false,
+                        receiverReady: false,
+                        createdAt: nowMs(),
+                        updatedAt: nowMs()
+                    };
+                    blackFlashSessions.set(id, session);
+                } else {
+                    session.updatedAt = nowMs();
+                }
+
+                notifyBlackFlashPlayer(currentServerId, sender, {
+                    type: 'invite_sent',
+                    inviteId: session.id,
+                    receiver: session.receiver,
+                    status: session.status
+                });
+                notifyBlackFlashPlayer(currentServerId, receiver, {
+                    type: 'incoming_invite',
+                    inviteId: session.id,
+                    sender: session.sender,
+                    receiver: session.receiver
+                });
+                return;
+            }
+
+            if (type === 'respond') {
+                const { inviteId, player, accepted } = msg;
+                const session = blackFlashSessions.get(inviteId);
+                if (!session || session.serverId !== currentServerId) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'session not found' });
+                    return;
+                }
+                if (player !== session.receiver && player !== session.sender) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+
+                if (!accepted) {
+                    session.status = 'rejected';
+                    session.updatedAt = nowMs();
+                    broadcastBlackFlashSession(session, {
+                        type: 'invite_rejected',
+                        inviteId: session.id,
+                        by: player
+                    });
+                    return;
+                }
+
+                session.status = 'accepted';
+                session.updatedAt = nowMs();
+                broadcastBlackFlashSession(session, {
+                    type: 'invite_accepted',
+                    inviteId: session.id,
+                    sender: session.sender,
+                    receiver: session.receiver
+                });
+                return;
+            }
+
+            if (type === 'start') {
+                const { inviteId, player, role, ready } = msg;
+                const session = blackFlashSessions.get(inviteId);
+                if (!session || session.serverId !== currentServerId) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'session not found' });
+                    return;
+                }
+                const setReady = ready !== false;
+                if (player === session.sender || role === 'sender') {
+                    session.senderReady = setReady;
+                } else if (player === session.receiver || role === 'receiver') {
+                    session.receiverReady = setReady;
+                } else {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+
+                session.status = (session.senderReady && session.receiverReady) ? 'started' : 'accepted';
+                session.updatedAt = nowMs();
+
+                broadcastBlackFlashSession(session, {
+                    type: 'ready_update',
+                    inviteId: session.id,
+                    status: session.status,
+                    senderReady: session.senderReady,
+                    receiverReady: session.receiverReady
+                });
+
+                if (session.status === 'started') {
+                    broadcastBlackFlashSession(session, {
+                        type: 'session_started',
+                        inviteId: session.id,
+                        sender: session.sender,
+                        receiver: session.receiver
+                    });
+                }
+                return;
+            }
+
+            if (type === 'end') {
+                const { inviteId, player } = msg;
+                const session = blackFlashSessions.get(inviteId);
+                if (!session) return;
+                if (player && player !== session.sender && player !== session.receiver) {
+                    sendBlackFlashWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                session.status = 'ended';
+                session.updatedAt = nowMs();
+                broadcastBlackFlashSession(session, {
+                    type: 'session_ended',
+                    inviteId: session.id,
+                    by: player || null
+                });
+                blackFlashSessions.delete(inviteId);
+                return;
+            }
+
+            if (type === 'ping') {
+                sendBlackFlashWs(ws, { type: 'pong', time: nowMs() });
+            }
+        } catch (_) {
+            sendBlackFlashWs(ws, { type: 'error', message: 'bad payload' });
+        }
+    });
+
+    ws.on('close', () => {
+        if (currentServerId && currentPlayer) {
+            blackFlashSockets.delete(blackFlashPlayerKey(currentServerId, currentPlayer));
+        }
+    });
+});
 // Middleware
 app.use(cors());
 app.use(express.json());
