@@ -56,9 +56,11 @@ const blackFlashSockets = new Map();
 const BLACKFLASH_TTL_MS = 15 * 60 * 1000;
 const chatMemoryHistoryByServer = new Map();
 const chatClients = new Set();
-const MAX_CHAT_HISTORY = 500;
+const MAX_CHAT_HISTORY = 50;
 const privateChatRooms = new Map();
 const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
+const pendingPrivateInvites = new Map();
+const PRIVATE_INVITE_TTL_MS = 2 * 60 * 1000;
 
 function nowMs() {
     return Date.now();
@@ -295,18 +297,27 @@ function chatClientKey(serverId, playerName) {
 }
 
 const BLOCKED_CHAT_PHRASES = [
-    'fuck',
-    'fuk',
-    'fck',
-    'motherfucker',
-    'mẹ mày',
-    'mẹ mày béo',
-    'me may',
-    'me may beo',
-    'dit me',
-    'địt mẹ',
-    'đụ mẹ',
-    'du me'
+    // Explicit sexual profanity
+    '\u0111\u1ecbt',
+    'dit',
+    // Gore / excessive violence
+    'ch\u1eb7t \u0111\u1ea7u',
+    'chat dau',
+    '\u0111\u1ee9t \u0111\u1ea7u',
+    'dut dau',
+    'c\u1eaft c\u1ed5',
+    'cat co',
+    'm\u00f3c m\u1eaft',
+    'moc mat',
+    'moi ru\u1ed9t',
+    'moi ruot',
+    'x\u1ebb x\u00e1c',
+    'xe xac',
+    'phanh th\u00e2y',
+    'phanh thay',
+    'behead',
+    'decapitate',
+    'dismember'
 ];
 
 function sanitizeChatText(text) {
@@ -431,6 +442,20 @@ function makePrivateRoomId(serverId, p1, p2) {
     return `pm_${serverId}_${sorted[0]}_${sorted[1]}`;
 }
 
+function makePrivateInviteId(serverId, fromName, toName) {
+    const seed = Math.random().toString(36).slice(2, 8);
+    return `pmi_${serverId}_${fromName}_${toName}_${Date.now().toString(36)}_${seed}`;
+}
+
+function cleanupPrivateInvites() {
+    const now = Date.now();
+    for (const [id, invite] of pendingPrivateInvites.entries()) {
+        if (!invite || now - (invite.createdAt || now) > PRIVATE_INVITE_TTL_MS) {
+            pendingPrivateInvites.delete(id);
+        }
+    }
+}
+
 function getOrCreatePrivateRoom(serverId, p1, p2) {
     const id = makePrivateRoomId(serverId, p1, p2);
     let room = privateChatRooms.get(id);
@@ -479,6 +504,7 @@ robloxChatWsServer.on('connection', (ws) => {
     ws.on('message', async (raw) => {
         try {
             cleanupPrivateRooms();
+            cleanupPrivateInvites();
             const msg = JSON.parse(raw.toString());
             const type = msg && msg.type;
 
@@ -572,21 +598,95 @@ robloxChatWsServer.on('connection', (ws) => {
                     return;
                 }
 
-                const room = getOrCreatePrivateRoom(ws.meta.serverId, ws.meta.playerName, targetName);
-                const forSender = {
+                let existingInvite = null;
+                for (const invite of pendingPrivateInvites.values()) {
+                    if (!invite) continue;
+                    if (invite.serverId !== ws.meta.serverId) continue;
+                    if (invite.fromName === ws.meta.playerName && invite.toName === targetName) {
+                        existingInvite = invite;
+                        break;
+                    }
+                }
+
+                let invite = existingInvite;
+                if (!invite) {
+                    invite = {
+                        id: makePrivateInviteId(ws.meta.serverId, ws.meta.playerName, targetName),
+                        serverId: ws.meta.serverId,
+                        fromName: ws.meta.playerName,
+                        fromDisplayName: ws.meta.displayName,
+                        toName: targetName,
+                        createdAt: Date.now()
+                    };
+                    pendingPrivateInvites.set(invite.id, invite);
+                } else {
+                    invite.createdAt = Date.now();
+                }
+
+                sendChatWs(ws, {
+                    type: 'private_invite_sent',
+                    inviteId: invite.id,
+                    targetName
+                });
+
+                sendChatWs(targetSocket, {
+                    type: 'private_invite',
+                    inviteId: invite.id,
+                    fromName: invite.fromName,
+                    fromDisplayName: invite.fromDisplayName
+                });
+                return;
+            }
+
+            if (type === 'private_invite_response') {
+                const inviteId = String(msg.inviteId || '').trim();
+                const accepted = msg.accepted !== false;
+                const invite = pendingPrivateInvites.get(inviteId);
+                if (!invite || invite.serverId !== ws.meta.serverId) {
+                    sendChatWs(ws, { type: 'error', message: 'invite not found' });
+                    return;
+                }
+                if (invite.toName !== ws.meta.playerName) {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden invite response' });
+                    return;
+                }
+                pendingPrivateInvites.delete(inviteId);
+
+                const senderSocket = chatSocketOf(invite.serverId, invite.fromName);
+                if (!accepted) {
+                    if (senderSocket) {
+                        sendChatWs(senderSocket, {
+                            type: 'private_invite_declined',
+                            inviteId,
+                            targetName: invite.toName
+                        });
+                    }
+                    sendChatWs(ws, {
+                        type: 'private_invite_declined_ack',
+                        inviteId,
+                        fromName: invite.fromName
+                    });
+                    return;
+                }
+
+                if (!senderSocket) {
+                    sendChatWs(ws, { type: 'error', message: 'sender offline' });
+                    return;
+                }
+
+                const room = getOrCreatePrivateRoom(invite.serverId, invite.fromName, invite.toName);
+                sendChatWs(senderSocket, {
                     type: 'private_opened',
                     roomId: room.id,
-                    targetName,
-                    roomName: `PM ${targetName}`
-                };
-                const forTarget = {
+                    targetName: invite.toName,
+                    roomName: `PM ${invite.toName}`
+                });
+                sendChatWs(ws, {
                     type: 'private_opened',
                     roomId: room.id,
-                    targetName: ws.meta.playerName,
-                    roomName: `PM ${ws.meta.playerName}`
-                };
-                sendChatWs(ws, forSender);
-                sendChatWs(targetSocket, forTarget);
+                    targetName: invite.fromName,
+                    roomName: `PM ${invite.fromName}`
+                });
                 return;
             }
 
@@ -643,6 +743,20 @@ robloxChatWsServer.on('connection', (ws) => {
 
     ws.on('close', () => {
         if (ws.meta && ws.meta.serverId && ws.meta.playerName) {
+            for (const [inviteId, invite] of pendingPrivateInvites.entries()) {
+                if (!invite || invite.serverId !== ws.meta.serverId) continue;
+                if (invite.fromName !== ws.meta.playerName && invite.toName !== ws.meta.playerName) continue;
+                pendingPrivateInvites.delete(inviteId);
+                const otherPlayer = invite.fromName === ws.meta.playerName ? invite.toName : invite.fromName;
+                const otherSock = chatSocketOf(ws.meta.serverId, otherPlayer);
+                if (otherSock) {
+                    sendChatWs(otherSock, {
+                        type: 'private_invite_cancelled',
+                        inviteId,
+                        playerName: ws.meta.playerName
+                    });
+                }
+            }
             for (const [roomId, room] of privateChatRooms.entries()) {
                 if (room.serverId !== ws.meta.serverId) continue;
                 if (!isPlayerInRoom(room, ws.meta.playerName)) continue;
