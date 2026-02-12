@@ -1918,6 +1918,8 @@ async function saveServerChatMessage(message) {
     const channel = normalizePublicChannel(message.channel, 'server');
     const payload = {
         server_id: scopedHistoryServerId(message.serverId, channel),
+        // Actual Roblox server JobId for teleport/join. `server_id` can be scoped (e.g. __shared_public__).
+        job_id: message.serverId || null,
         channel: channel,
         place_id: message.placeId || null,
         player_name: message.playerName,
@@ -2006,6 +2008,7 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
         id: row.id,
         channel: normalizePublicChannel(row.channel, 'server'),
         serverId: row.server_id,
+        jobId: row.job_id || null,
         placeId: row.place_id,
         playerName: row.player_name,
         displayName: row.display_name || row.player_name,
