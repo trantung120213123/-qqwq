@@ -104,14 +104,21 @@ function nowMs() {
 }
 
 function historyLoadLimitForChannel(channel, fallback = MAX_CHAT_HISTORY) {
-    const key = String(channel || '').toLowerCase();
+    const key = normalizePublicChannel(channel, '');
     const fromMap = Number(HISTORY_LOAD_LIMIT_BY_CHANNEL[key] || 0) || 0;
     if (fromMap > 0) return fromMap;
     return Number(fallback || MAX_CHAT_HISTORY) || MAX_CHAT_HISTORY;
 }
 
+function normalizePublicChannel(channel, fallback = 'server') {
+    const key = String(channel || '').trim().toLowerCase();
+    const mapped = key === 'gobal' ? 'global' : key;
+    if (PUBLIC_CHAT_CHANNELS.includes(mapped)) return mapped;
+    return fallback;
+}
+
 function scopedHistoryServerId(serverId, channel = 'server') {
-    const normalizedChannel = String(channel || 'server').toLowerCase();
+    const normalizedChannel = normalizePublicChannel(channel, 'server');
     if (normalizedChannel === 'server') {
         return String(serverId || '').trim();
     }
@@ -501,12 +508,6 @@ function applyContentPolicy(text) {
             output = '##';
             break;
         }
-    }
-
-    if (hasBlockedLink(output)) {
-        matched = true;
-        reasons.add('link');
-        output = censorBlockedLinks(output);
     }
 
     output = output.trim();
@@ -1060,6 +1061,101 @@ function findOnlineMeta(serverId, username) {
     return null;
 }
 
+async function executeMuteSlashCore(sender, raw, context = {}) {
+    const text = String(raw || '').trim();
+    if (!text.startsWith('/')) return { handled: false };
+    const parts = text.split(/\s+/);
+    const cmd = String(parts[0] || '').toLowerCase();
+    if (cmd !== '/mute' && cmd !== '/tempmute' && cmd !== '/unsmute' && cmd !== '/unmute') {
+        return { handled: false };
+    }
+    const role = await getChatRole(sender.playerName);
+    const isAdmin = role === 'admin';
+    const isModOrAdmin = isAdmin || role === 'mod';
+    if (!isModOrAdmin) {
+        return { handled: true, ok: false, message: 'forbidden command (admin/mod only)' };
+    }
+
+    if (cmd === '/mute' || cmd === '/tempmute') {
+        const targetName = normalizeUsernameInput(parts[1]);
+        const durationRaw = String(parts[2] || '').trim().toLowerCase();
+        const durationMs = parseDurationShort(durationRaw);
+        if (!targetName || !durationMs) {
+            return { handled: true, ok: false, message: `Usage: ${cmd} username [1d|3d|7d]` };
+        }
+        if (usernameLower(targetName) === usernameLower(sender.playerName)) {
+            return { handled: true, ok: false, message: 'cannot mute yourself' };
+        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName);
+        if (!targetMeta) {
+            return { handled: true, ok: false, message: 'target must be online' };
+        }
+        const targetRole = await getChatRole(targetMeta.playerName);
+        if (!staffCanModerateTarget(role, targetRole)) {
+            return { handled: true, ok: false, message: 'cannot target this role' };
+        }
+        if (!isAdmin) {
+            const maxMs = cmd === '/tempmute'
+                ? 24 * 60 * 60 * 1000
+                : 7 * 24 * 60 * 60 * 1000;
+            if (durationMs > maxMs) {
+                return { handled: true, ok: false, message: `mod ${cmd === '/tempmute' ? 'max 1d' : 'max 7d'}` };
+            }
+        }
+        const muteUntil = await upsertAdminMute(targetMeta, sender.playerName, durationMs, `manual ${role} mute`);
+        await applyManualMuteToModerationState(targetMeta, muteUntil);
+        await logStaffAction({
+            actorMeta: sender,
+            actorRole: role,
+            action: cmd === '/tempmute' ? 'tempmute' : 'mute',
+            targetMeta,
+            detail: { duration: durationRaw, command: text, context }
+        });
+        await broadcastSystemMessage(sender.serverId, `[MOD] ${sender.playerName} muted ${targetMeta.playerName} (${durationRaw})`);
+        const targetSocket = chatSocketOf(sender.serverId, targetMeta.playerName);
+        if (targetSocket) {
+            sendChatWs(targetSocket, {
+                type: 'moderation_muted',
+                message: `Bạn đã bị mute bởi ${sender.playerName} trong ${durationRaw}.`,
+                strikeLevel: 0
+            });
+        }
+        return {
+            handled: true,
+            ok: true,
+            message: `${cmd === '/tempmute' ? 'Tempmuted' : 'Muted'} ${targetMeta.playerName} for ${durationRaw}`
+        };
+    }
+
+    const targetName = normalizeUsernameInput(parts[1]);
+    if (!targetName) {
+        return { handled: true, ok: false, message: 'Usage: /unsmute username' };
+    }
+    const targetRole = await getChatRole(targetName);
+    if (!staffCanModerateTarget(role, targetRole)) {
+        return { handled: true, ok: false, message: 'cannot target this role' };
+    }
+    if (!isAdmin) {
+        const activeMute = await getActiveAdminMuteByName(targetName);
+        if (!activeMute) {
+            return { handled: true, ok: false, message: `${targetName} is not muted` };
+        }
+        if (usernameLower(activeMute.muted_by) !== usernameLower(sender.playerName)) {
+            return { handled: true, ok: false, message: 'mod can only unsmute users muted by yourself' };
+        }
+    }
+    await removeAdminMute(targetName);
+    await logStaffAction({
+        actorMeta: sender,
+        actorRole: role,
+        action: 'unsmute',
+        targetMeta: { playerName: targetName, userId: 0 },
+        detail: { command: text, context }
+    });
+    await broadcastSystemMessage(sender.serverId, `[MOD] ${sender.playerName} unsmuted ${targetName}`);
+    return { handled: true, ok: true, message: `Unsmuted ${targetName}` };
+}
+
 async function executeSlashCommand(ws, text, context = {}) {
     const raw = String(text || '').trim();
     if (!raw.startsWith('/')) return { handled: false };
@@ -1082,6 +1178,15 @@ async function executeSlashCommand(ws, text, context = {}) {
         sendChatWs(ws, { type: 'error', message: 'forbidden command (admin only)' });
         return false;
     };
+
+    const muteCmd = await executeMuteSlashCore(sender, raw, context);
+    if (muteCmd.handled) {
+        sendChatWs(ws, {
+            type: muteCmd.ok ? 'command_result' : 'error',
+            message: muteCmd.message
+        });
+        return { handled: true };
+    }
 
     if (cmd === '/addmod') {
         if (!requireAdmin()) return { handled: true };
@@ -1742,7 +1847,7 @@ function pushServerMemoryHistory(serverId, channel, message) {
 }
 
 async function saveServerChatMessage(message) {
-    const channel = String(message.channel || 'server').toLowerCase();
+    const channel = normalizePublicChannel(message.channel, 'server');
     const payload = {
         server_id: scopedHistoryServerId(message.serverId, channel),
         channel: channel,
@@ -1780,7 +1885,7 @@ async function pruneServerChatHistory(serverId, channel = 'server', limit = MAX_
 }
 
 async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_CHAT_HISTORY) {
-    const normalizedChannel = String(channel || 'server').toLowerCase();
+    const normalizedChannel = normalizePublicChannel(channel, 'server');
     const scopedServerId = scopedHistoryServerId(serverId, normalizedChannel);
     let rows = [];
     if (normalizedChannel === 'server') {
@@ -1831,7 +1936,7 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
 
     return rows.reverse().map((row) => ({
         id: row.id,
-        channel: row.channel || 'server',
+        channel: normalizePublicChannel(row.channel, 'server'),
         serverId: row.server_id,
         placeId: row.place_id,
         playerName: row.player_name,
@@ -2087,7 +2192,7 @@ robloxChatWsServer.on('connection', (ws) => {
             }
 
             if (type === 'chat_message') {
-                const channel = String(msg.channel || 'server').toLowerCase();
+                const channel = normalizePublicChannel(msg.channel, 'server');
                 const rawText = sanitizeChatText(msg.text);
                 const replyTo = sanitizeReplyMeta(msg.replyTo);
                 let text = rawText;
@@ -3816,7 +3921,7 @@ app.post('/api/chat/send', async (req, res) => {
         const displayNameRaw = String(req.body?.displayName || '').trim();
         const displayName = displayNameRaw || playerName;
         const userId = Number(req.body?.userId || 0) || 0;
-        const channel = String(req.body?.channel || 'server').trim().toLowerCase();
+        const channel = normalizePublicChannel(req.body?.channel, 'server');
         const rawText = sanitizeChatText(req.body?.text);
         const replyTo = sanitizeReplyMeta(req.body?.replyTo);
         let text = rawText;
@@ -3896,11 +4001,44 @@ app.post('/api/chat/send', async (req, res) => {
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
 });
+app.post('/api/chat/command', async (req, res) => {
+    try {
+        const serverId = String(req.body?.serverId || '').trim();
+        const placeId = Number(req.body?.placeId || 0) || 0;
+        const playerName = String(req.body?.playerName || '').trim();
+        const displayNameRaw = String(req.body?.displayName || '').trim();
+        const displayName = displayNameRaw || playerName;
+        const userId = Number(req.body?.userId || 0) || 0;
+        const roomId = String(req.body?.roomId || '').trim();
+        const channel = roomId ? 'private' : normalizePublicChannel(req.body?.channel, 'server');
+        const rawText = String(req.body?.text || '').trim();
+
+        if (!serverId || !playerName || !rawText) {
+            return res.status(400).json({ success: false, message: 'missing serverId/playerName/text' });
+        }
+        if (!rawText.startsWith('/')) {
+            return res.status(400).json({ success: false, message: 'not a slash command' });
+        }
+
+        const senderMeta = buildSenderMeta({ serverId, placeId, playerName, displayName, userId });
+        const command = await executeMuteSlashCore(senderMeta, rawText, { channel, roomId: roomId || null, via: 'http' });
+        if (!command.handled) {
+            return res.status(400).json({ success: false, message: 'unsupported command for HTTP' });
+        }
+        if (!command.ok) {
+            return res.status(403).json({ success: false, message: command.message });
+        }
+        return res.json({ success: true, data: { message: command.message } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
 app.get('/api/chat/server/history', async (req, res) => {
     try {
         const serverId = String(req.query?.serverId || '').trim();
-        const channelRaw = String(req.query?.channel || 'server').trim().toLowerCase();
-        const allChannels = channelRaw === 'all';
+        const channelQuery = String(req.query?.channel || 'server').trim().toLowerCase();
+        const allChannels = channelQuery === 'all';
+        const channelRaw = allChannels ? 'all' : normalizePublicChannel(channelQuery, '__invalid__');
         const defaultLimit = allChannels ? MAX_CHAT_HISTORY : historyLoadLimitForChannel(channelRaw, MAX_CHAT_HISTORY);
         const limit = Math.min(Math.max(Number(req.query?.limit || defaultLimit) || defaultLimit, 1), MAX_CHAT_HISTORY);
         if (!serverId) {
