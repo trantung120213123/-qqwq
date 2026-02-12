@@ -69,6 +69,7 @@ const HISTORY_LOAD_LIMIT_BY_CHANNEL = {
 const privateChatRooms = new Map();
 const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const pendingPrivateInvites = new Map();
+const pendingPrivateRoomOpens = new Map();
 const PRIVATE_INVITE_TTL_MS = 2 * 60 * 1000;
 const WARNING_LIMIT = 3;
 const RATE_LIMIT_MIN_INTERVAL_MS = 1000;
@@ -1086,10 +1087,7 @@ async function executeMuteSlashCore(sender, raw, context = {}) {
         if (usernameLower(targetName) === usernameLower(sender.playerName)) {
             return { handled: true, ok: false, message: 'cannot mute yourself' };
         }
-        const targetMeta = findOnlineMeta(sender.serverId, targetName);
-        if (!targetMeta) {
-            return { handled: true, ok: false, message: 'target must be online' };
-        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
         const targetRole = await getChatRole(targetMeta.playerName);
         if (!staffCanModerateTarget(role, targetRole)) {
             return { handled: true, ok: false, message: 'cannot target this role' };
@@ -1185,6 +1183,80 @@ async function executeSlashCommand(ws, text, context = {}) {
             type: muteCmd.ok ? 'command_result' : 'error',
             message: muteCmd.message
         });
+        return { handled: true };
+    }
+
+    if (cmd === '/level') {
+        if (!requireAdmin()) return { handled: true };
+        const levelRaw = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[2]);
+        const nextLevel = Number.parseInt(levelRaw, 10);
+        if (!Number.isFinite(nextLevel) || !targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /level [1-10] username' });
+            return { handled: true };
+        }
+        const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, nextLevel));
+        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
+        const payload = {
+            user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+            user_id: targetMeta.userId || null,
+            player_name: targetMeta.playerName,
+            level,
+            xp: 0
+        };
+        try {
+            const { error } = await supabase
+                .from('chat_player_levels')
+                .upsert(payload, { onConflict: 'user_key' });
+            if (error) throw error;
+        } catch (_) {
+            sendChatWs(ws, { type: 'error', message: 'set level failed' });
+            return { handled: true };
+        }
+        sendChatWs(ws, { type: 'command_result', message: `Set ${payload.player_name} to level ${level}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/up') {
+        if (!requireAdmin()) return { handled: true };
+        const deltaRaw = String(parts[1] || '').trim();
+        const targetName = normalizeUsernameInput(parts[2]);
+        const delta = Number.parseInt(deltaRaw, 10);
+        if (!Number.isFinite(delta) || !targetName) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /up [delta] username' });
+            return { handled: true };
+        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
+        const userKey = policyUserKey(targetMeta.userId, targetMeta.playerName);
+        let currentLevel = 1;
+        try {
+            const { data, error } = await supabase
+                .from('chat_player_levels')
+                .select('level')
+                .eq('user_key', userKey)
+                .limit(1);
+            if (!error && Array.isArray(data) && data[0] && Number.isFinite(Number(data[0].level))) {
+                currentLevel = Number(data[0].level);
+            }
+        } catch (_) {}
+        const nextLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, currentLevel + delta));
+        const payload = {
+            user_key: userKey,
+            user_id: targetMeta.userId || null,
+            player_name: targetMeta.playerName,
+            level: nextLevel,
+            xp: 0
+        };
+        try {
+            const { error } = await supabase
+                .from('chat_player_levels')
+                .upsert(payload, { onConflict: 'user_key' });
+            if (error) throw error;
+        } catch (_) {
+            sendChatWs(ws, { type: 'error', message: 'up level failed' });
+            return { handled: true };
+        }
+        sendChatWs(ws, { type: 'command_result', message: `Up ${payload.player_name} by ${delta} -> level ${nextLevel}` });
         return { handled: true };
     }
 
@@ -1341,11 +1413,7 @@ async function executeSlashCommand(ws, text, context = {}) {
             sendChatWs(ws, { type: 'error', message: 'cannot mute yourself' });
             return { handled: true };
         }
-        const targetMeta = findOnlineMeta(sender.serverId, targetName);
-        if (!targetMeta) {
-            sendChatWs(ws, { type: 'error', message: 'target must be online' });
-            return { handled: true };
-        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
         const targetRole = await getChatRole(targetMeta.playerName);
         if (!staffCanModerateTarget(role, targetRole)) {
             sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
@@ -1432,11 +1500,7 @@ async function executeSlashCommand(ws, text, context = {}) {
             sendChatWs(ws, { type: 'error', message: 'Usage: /warn username' });
             return { handled: true };
         }
-        const targetMeta = findOnlineMeta(sender.serverId, targetName);
-        if (!targetMeta) {
-            sendChatWs(ws, { type: 'error', message: 'target must be online' });
-            return { handled: true };
-        }
+        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
         const targetRole = await getChatRole(targetMeta.playerName);
         if (!staffCanModerateTarget(role, targetRole)) {
             sendChatWs(ws, { type: 'error', message: 'cannot target this role' });
@@ -2074,6 +2138,37 @@ function makePrivateInviteId(serverId, fromName, toName) {
     return `pmi_${serverId}_${fromName}_${toName}_${Date.now().toString(36)}_${seed}`;
 }
 
+function pendingPrivateRoomOpenKey(serverId, playerName) {
+    return `${String(serverId || '').trim()}::${usernameLower(playerName)}`;
+}
+
+function queuePendingPrivateRoomOpen(serverId, playerName, payload) {
+    const key = pendingPrivateRoomOpenKey(serverId, playerName);
+    const list = pendingPrivateRoomOpens.get(key) || [];
+    list.push({
+        roomId: String(payload && payload.roomId ? payload.roomId : ''),
+        targetName: String(payload && payload.targetName ? payload.targetName : ''),
+        roomName: String(payload && payload.roomName ? payload.roomName : '')
+    });
+    pendingPrivateRoomOpens.set(key, list.slice(-10));
+}
+
+function flushPendingPrivateRoomOpens(serverId, playerName, ws) {
+    const key = pendingPrivateRoomOpenKey(serverId, playerName);
+    const list = pendingPrivateRoomOpens.get(key);
+    if (!Array.isArray(list) || list.length === 0) return;
+    pendingPrivateRoomOpens.delete(key);
+    for (const item of list) {
+        if (!item || !item.roomId) continue;
+        sendChatWs(ws, {
+            type: 'private_opened',
+            roomId: item.roomId,
+            targetName: item.targetName,
+            roomName: item.roomName
+        });
+    }
+}
+
 function cleanupPrivateInvites() {
     const now = Date.now();
     for (const [id, invite] of pendingPrivateInvites.entries()) {
@@ -2183,6 +2278,31 @@ robloxChatWsServer.on('connection', (ws) => {
                     playerName,
                     history
                 });
+
+                // Deliver pending private invites that were created while this player wasn't connected yet.
+                try {
+                    const now = Date.now();
+                    const receiverLower = usernameLower(playerName);
+                    for (const invite of pendingPrivateInvites.values()) {
+                        if (!invite) continue;
+                        if (invite.serverId !== serverId) continue;
+                        if (usernameLower(invite.toName) !== receiverLower) continue;
+                        if (now - (invite.createdAt || now) > PRIVATE_INVITE_TTL_MS) continue;
+                        if (Array.isArray(invite.deliveredToLower) && invite.deliveredToLower.includes(receiverLower)) continue;
+                        invite.deliveredToLower = Array.isArray(invite.deliveredToLower) ? invite.deliveredToLower : [];
+                        invite.deliveredToLower.push(receiverLower);
+                        sendChatWs(ws, {
+                            type: 'private_invite',
+                            inviteId: invite.id,
+                            fromName: invite.fromName,
+                            fromDisplayName: invite.fromDisplayName
+                        });
+                    }
+                } catch (_) {}
+                // Deliver pending private room opens (accept while sender was offline).
+                try {
+                    flushPendingPrivateRoomOpens(serverId, playerName, ws);
+                } catch (_) {}
                 return;
             }
 
@@ -2312,11 +2432,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     sendChatWs(ws, { type: 'error', message: 'private blocked by target' });
                     return;
                 }
-                if (!targetSocket) {
-                    sendChatWs(ws, { type: 'error', message: 'target offline' });
-                    return;
-                }
-                const canonicalTargetName = String(targetSocket.meta.playerName || targetName);
+                const canonicalTargetName = String((targetSocket && targetSocket.meta && targetSocket.meta.playerName) || targetName);
 
                 let existingInvite = null;
                 for (const invite of pendingPrivateInvites.values()) {
@@ -2349,12 +2465,14 @@ robloxChatWsServer.on('connection', (ws) => {
                     targetName: canonicalTargetName
                 });
 
-                sendChatWs(targetSocket, {
-                    type: 'private_invite',
-                    inviteId: invite.id,
-                    fromName: invite.fromName,
-                    fromDisplayName: invite.fromDisplayName
-                });
+                if (targetSocket) {
+                    sendChatWs(targetSocket, {
+                        type: 'private_invite',
+                        inviteId: invite.id,
+                        fromName: invite.fromName,
+                        fromDisplayName: invite.fromDisplayName
+                    });
+                }
                 return;
             }
 
@@ -2439,7 +2557,18 @@ robloxChatWsServer.on('connection', (ws) => {
                 }
 
                 if (!senderSocket) {
-                    sendChatWs(ws, { type: 'error', message: 'sender offline' });
+                    const room = getOrCreatePrivateRoom(invite.serverId, invite.fromName, invite.toName);
+                    queuePendingPrivateRoomOpen(invite.serverId, invite.fromName, {
+                        roomId: room.id,
+                        targetName: invite.toName,
+                        roomName: `PM ${invite.toName}`
+                    });
+                    sendChatWs(ws, {
+                        type: 'private_opened',
+                        roomId: room.id,
+                        targetName: invite.fromName,
+                        roomName: `PM ${invite.fromName}`
+                    });
                     return;
                 }
 
@@ -4021,14 +4150,93 @@ app.post('/api/chat/command', async (req, res) => {
         }
 
         const senderMeta = buildSenderMeta({ serverId, placeId, playerName, displayName, userId });
-        const command = await executeMuteSlashCore(senderMeta, rawText, { channel, roomId: roomId || null, via: 'http' });
-        if (!command.handled) {
+        const muteCommand = await executeMuteSlashCore(senderMeta, rawText, { channel, roomId: roomId || null, via: 'http' });
+        if (muteCommand.handled) {
+            if (!muteCommand.ok) {
+                return res.status(403).json({ success: false, message: muteCommand.message });
+            }
+            return res.json({ success: true, data: { message: muteCommand.message } });
+        }
+
+        // Allow admin-only level commands via HTTP (client uses request like /mute).
+        const cmd = rawText.split(/\s+/)[0]?.toLowerCase?.() || '';
+        if (cmd !== '/level' && cmd !== '/up') {
             return res.status(400).json({ success: false, message: 'unsupported command for HTTP' });
         }
-        if (!command.ok) {
-            return res.status(403).json({ success: false, message: command.message });
+
+        const role = await getChatRole(senderMeta.playerName);
+        if (role !== 'admin') {
+            return res.status(403).json({ success: false, message: 'forbidden command (admin only)' });
         }
-        return res.json({ success: true, data: { message: command.message } });
+
+        if (cmd === '/level') {
+            const parts = rawText.split(/\s+/);
+            const levelRaw = String(parts[1] || '').trim();
+            const targetName = normalizeUsernameInput(parts[2]);
+            const nextLevel = Number.parseInt(levelRaw, 10);
+            if (!Number.isFinite(nextLevel) || !targetName) {
+                return res.status(400).json({ success: false, message: 'Usage: /level [1-10] username' });
+            }
+            const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, nextLevel));
+            const targetMeta = findOnlineMeta(senderMeta.serverId, targetName) || { playerName: targetName, userId: 0 };
+            const payload = {
+                user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+                user_id: targetMeta.userId || null,
+                player_name: targetMeta.playerName,
+                level,
+                xp: 0
+            };
+            try {
+                const { error } = await supabase
+                    .from('chat_player_levels')
+                    .upsert(payload, { onConflict: 'user_key' });
+                if (error) throw error;
+            } catch (_) {
+                return res.status(500).json({ success: false, message: 'set level failed' });
+            }
+            return res.json({ success: true, data: { message: `Set ${payload.player_name} to level ${level}` } });
+        }
+
+        // cmd === '/up'
+        {
+            const parts = rawText.split(/\s+/);
+            const deltaRaw = String(parts[1] || '').trim();
+            const targetName = normalizeUsernameInput(parts[2]);
+            const delta = Number.parseInt(deltaRaw, 10);
+            if (!Number.isFinite(delta) || !targetName) {
+                return res.status(400).json({ success: false, message: 'Usage: /up [delta] username' });
+            }
+            const targetMeta = findOnlineMeta(senderMeta.serverId, targetName) || { playerName: targetName, userId: 0 };
+            const userKey = policyUserKey(targetMeta.userId, targetMeta.playerName);
+            let currentLevel = 1;
+            try {
+                const { data, error } = await supabase
+                    .from('chat_player_levels')
+                    .select('level')
+                    .eq('user_key', userKey)
+                    .limit(1);
+                if (!error && Array.isArray(data) && data[0] && Number.isFinite(Number(data[0].level))) {
+                    currentLevel = Number(data[0].level);
+                }
+            } catch (_) {}
+            const nextLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, currentLevel + delta));
+            const payload = {
+                user_key: userKey,
+                user_id: targetMeta.userId || null,
+                player_name: targetMeta.playerName,
+                level: nextLevel,
+                xp: 0
+            };
+            try {
+                const { error } = await supabase
+                    .from('chat_player_levels')
+                    .upsert(payload, { onConflict: 'user_key' });
+                if (error) throw error;
+            } catch (_) {
+                return res.status(500).json({ success: false, message: 'up level failed' });
+            }
+            return res.json({ success: true, data: { message: `Up ${payload.player_name} by ${delta} -> level ${nextLevel}` } });
+        }
     } catch (err) {
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
