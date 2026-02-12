@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = 'tungdeptrai1202';
@@ -71,6 +72,8 @@ const PRIVATE_ROOM_TTL_MS = 2 * 60 * 60 * 1000;
 const pendingPrivateInvites = new Map();
 const pendingPrivateRoomOpens = new Map();
 const PRIVATE_INVITE_TTL_MS = 2 * 60 * 1000;
+const pendingGroupInvites = new Map();
+const GROUP_INVITE_TTL_MS = 2 * 60 * 1000;
 const WARNING_LIMIT = 3;
 const RATE_LIMIT_MIN_INTERVAL_MS = 1000;
 const RATE_LIMIT_BURST_WINDOW_MS = 3000;
@@ -2231,6 +2234,231 @@ async function fetchPrivateRoomIndexForViewer(serverId, viewerMeta, limit = 25) 
     return out;
 }
 
+function makeGroupRoomId() {
+    return `gr_${crypto.randomUUID()}`;
+}
+
+function isGroupRoomId(roomId) {
+    return String(roomId || '').trim().startsWith('gr_');
+}
+
+async function fetchGroupRoomIndexForViewer(serverId, viewerMeta, limit = 25) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return [];
+    const safeLimit = Math.min(Math.max(Number(limit || 25) || 25, 1), 40);
+
+    // Join via FK room_id -> group_rooms.room_id
+    const { data, error } = await supabase
+        .from('group_room_members')
+        .select('room_id,role,group_rooms(name,updated_at,server_id)')
+        .in('user_key', keys)
+        .eq('group_rooms.server_id', String(serverId || '').trim())
+        .order('updated_at', { ascending: false })
+        .limit(safeLimit);
+
+    if (error) throw error;
+    const seen = new Set();
+    const out = [];
+    for (const row of (data || [])) {
+        if (!row || !row.room_id) continue;
+        if (seen.has(row.room_id)) continue;
+        const room = row.group_rooms;
+        if (!room || room.server_id !== String(serverId || '').trim()) continue;
+        seen.add(row.room_id);
+        out.push({
+            roomId: row.room_id,
+            roomName: String(room.name || 'Group Room'),
+            role: String(row.role || 'member')
+        });
+    }
+    return out;
+}
+
+async function viewerHasGroupRoomAccess(serverId, viewerMeta, roomId) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return false;
+    const rid = String(roomId || '').trim();
+    if (!rid) return false;
+    const { data, error } = await supabase
+        .from('group_room_members')
+        .select('room_id,group_rooms(server_id)')
+        .eq('room_id', rid)
+        .in('user_key', keys)
+        .limit(1);
+    if (error) return false;
+    if (!Array.isArray(data) || data.length === 0) return false;
+    const row = data[0];
+    return row && row.group_rooms && row.group_rooms.server_id === String(serverId || '').trim();
+}
+
+async function fetchGroupRoomViewerRole(roomId, viewerMeta) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return null;
+    const { data, error } = await supabase
+        .from('group_room_members')
+        .select('role,user_key')
+        .eq('room_id', String(roomId || '').trim())
+        .in('user_key', keys)
+        .limit(2);
+    if (error) return null;
+    if (!Array.isArray(data) || data.length === 0) return null;
+    return String(data[0].role || 'member');
+}
+
+async function fetchGroupRoomMembers(roomId) {
+    const { data, error } = await supabase
+        .from('group_room_members')
+        .select('user_key,user_id,player_name,role,joined_at,updated_at')
+        .eq('room_id', String(roomId || '').trim())
+        .limit(100);
+    if (error) throw error;
+    const list = (data || []).map((r) => ({
+        userKey: r.user_key,
+        userId: Number(r.user_id || 0) || 0,
+        playerName: String(r.player_name || ''),
+        role: String(r.role || 'member')
+    }));
+    const weight = (role) => (role === 'leader' ? 0 : role === 'deputy' ? 1 : 2);
+    list.sort((a, b) => {
+        const wa = weight(a.role);
+        const wb = weight(b.role);
+        if (wa !== wb) return wa - wb;
+        return usernameLower(a.playerName).localeCompare(usernameLower(b.playerName));
+    });
+    return list;
+}
+
+async function createGroupRoom(serverId, creatorMeta, roomNameRaw, otherMetaOrName) {
+    const rid = makeGroupRoomId();
+    const server = String(serverId || '').trim();
+    const creatorKey = policyUserKey(creatorMeta.userId, creatorMeta.playerName);
+    if (!creatorKey) throw new Error('missing creator key');
+
+    const otherName = String(otherMetaOrName?.playerName || otherMetaOrName || '').trim();
+    if (!otherName) throw new Error('missing target name');
+    const otherMeta = typeof otherMetaOrName === 'object' ? otherMetaOrName : bestEffortMetaOf(server, otherName);
+    const otherKey = policyUserKey(otherMeta.userId, otherMeta.playerName);
+    if (!otherKey) throw new Error('missing target key');
+
+    const roomName = String(roomNameRaw || '').trim().slice(0, 48) || `Room`;
+
+    const { error: roomErr } = await supabase.from('group_rooms').insert({
+        room_id: rid,
+        server_id: server,
+        name: roomName,
+        created_by_key: creatorKey,
+        created_by_name: String(creatorMeta.playerName || '').trim()
+    });
+    if (roomErr) throw roomErr;
+
+    const { error: memErr } = await supabase.from('group_room_members').insert([
+        {
+            room_id: rid,
+            user_key: creatorKey,
+            user_id: Number(creatorMeta.userId || 0) || null,
+            player_name: String(creatorMeta.playerName || '').trim(),
+            role: 'leader'
+        },
+        {
+            room_id: rid,
+            user_key: otherKey,
+            user_id: Number(otherMeta.userId || 0) || null,
+            player_name: String(otherMeta.playerName || otherName || '').trim(),
+            role: 'member'
+        }
+    ]);
+    if (memErr) throw memErr;
+
+    return { roomId: rid, roomName };
+}
+
+async function upsertGroupRoomMember(roomId, memberMetaOrName, role = 'member') {
+    const memberName = String(memberMetaOrName?.playerName || memberMetaOrName || '').trim();
+    if (!memberName) throw new Error('missing member');
+    const memberMeta = typeof memberMetaOrName === 'object' ? memberMetaOrName : bestEffortMetaOf('', memberName);
+    const userKey = policyUserKey(memberMeta.userId, memberMeta.playerName || memberName);
+    if (!userKey) throw new Error('missing user key');
+    const payload = {
+        room_id: String(roomId || '').trim(),
+        user_key: userKey,
+        user_id: Number(memberMeta.userId || 0) || null,
+        player_name: String(memberMeta.playerName || memberName).trim(),
+        role: String(role || 'member')
+    };
+    const { error } = await supabase.from('group_room_members').upsert(payload, { onConflict: 'room_id,user_key' });
+    if (error) throw error;
+    return { userKey, playerName: payload.player_name, role: payload.role };
+}
+
+async function saveGroupRoomMessage(out) {
+    const payload = {
+        room_id: String(out.roomId || '').trim(),
+        server_id: String(out.serverId || '').trim(),
+        place_id: Number(out.placeId || 0) || null,
+        player_name: String(out.playerName || '').trim(),
+        display_name: String(out.displayName || '').trim() || null,
+        user_id: Number(out.userId || 0) || null,
+        text: String(out.text || ''),
+        reply_to: out.replyTo || null,
+        sender_level: Number(out.level || 1) || 1,
+        sender_style: String(out.levelStyle || '') || null,
+        sender_role: String(out.senderRole || 'user')
+    };
+    const { error } = await supabase.from('group_room_messages').insert(payload);
+    if (error) throw error;
+    try {
+        await supabase.from('group_rooms').update({ updated_at: new Date().toISOString() }).eq('room_id', payload.room_id);
+    } catch (_) {}
+}
+
+async function fetchGroupRoomHistory(roomId, limit = 50) {
+    const safeLimit = Math.min(Math.max(Number(limit || 50) || 50, 1), 50);
+    const { data, error } = await supabase
+        .from('group_room_messages')
+        .select('id,room_id,server_id,place_id,player_name,display_name,user_id,text,reply_to,sender_level,sender_style,sender_role,created_at')
+        .eq('room_id', String(roomId || '').trim())
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .limit(safeLimit);
+    if (error) throw error;
+    return (data || []).map((row) => ({
+        id: row.id,
+        type: 'chat_message',
+        channel: 'private',
+        roomId: row.room_id,
+        serverId: row.server_id,
+        placeId: row.place_id,
+        playerName: row.player_name,
+        displayName: row.display_name || row.player_name,
+        userId: row.user_id || 0,
+        text: row.text,
+        replyTo: row.reply_to || null,
+        level: isOwnerName(row.player_name) ? MAX_CHAT_LEVEL : (Number(row.sender_level || 1) || 1),
+        levelStyle: isOwnerName(row.player_name)
+            ? levelStyleName(MAX_CHAT_LEVEL)
+            : String(row.sender_style || levelStyleName(Number(row.sender_level || 1))),
+        senderRole: isOwnerName(row.player_name)
+            ? 'admin'
+            : String(row.sender_role || 'user'),
+        createdAt: row.created_at || new Date().toISOString()
+    }));
+}
+
+async function isMutedInGroupRoom(roomId, viewerMeta) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return false;
+    const nowIso = new Date().toISOString();
+    const { data, error } = await supabase
+        .from('group_room_mutes')
+        .select('room_id')
+        .eq('room_id', String(roomId || '').trim())
+        .in('target_user_key', keys)
+        .gt('muted_until', nowIso)
+        .limit(1);
+    if (error) return false;
+    return Array.isArray(data) && data.length > 0;
+}
+
 function chatSocketOf(serverId, playerName) {
     const targetServer = String(serverId || '').trim();
     const targetLower = usernameLower(playerName);
@@ -2286,6 +2514,11 @@ function makePrivateInviteId(serverId, fromName, toName) {
     return `pmi_${serverId}_${fromName}_${toName}_${Date.now().toString(36)}_${seed}`;
 }
 
+function makeGroupInviteId(serverId, fromName, toName) {
+    const seed = Math.random().toString(36).slice(2, 8);
+    return `gri_${serverId}_${fromName}_${toName}_${Date.now().toString(36)}_${seed}`;
+}
+
 function pendingPrivateRoomOpenKey(serverId, playerName) {
     return `${String(serverId || '').trim()}::${usernameLower(playerName)}`;
 }
@@ -2322,6 +2555,15 @@ function cleanupPrivateInvites() {
     for (const [id, invite] of pendingPrivateInvites.entries()) {
         if (!invite || now - (invite.createdAt || now) > PRIVATE_INVITE_TTL_MS) {
             pendingPrivateInvites.delete(id);
+        }
+    }
+}
+
+function cleanupGroupInvites() {
+    const now = Date.now();
+    for (const [id, invite] of pendingGroupInvites.entries()) {
+        if (!invite || now - (invite.createdAt || now) > GROUP_INVITE_TTL_MS) {
+            pendingGroupInvites.delete(id);
         }
     }
 }
@@ -2378,6 +2620,36 @@ async function broadcastPrivateRoom(room, payload) {
     }
 }
 
+async function broadcastGroupRoom(serverId, roomId, payload) {
+    const rid = String(roomId || '').trim();
+    if (!rid) return;
+    let members = [];
+    try {
+        members = await fetchGroupRoomMembers(rid);
+    } catch (_) {
+        members = [];
+    }
+    for (const m of members) {
+        const playerName = String(m.playerName || '').trim();
+        if (!playerName) continue;
+        const sock = chatSocketOf(serverId, playerName);
+        if (!sock) continue;
+
+        let out = payload;
+        if (payload && payload.type === 'chat_message' && payload.channel === 'private' && payload.playerName && payload.playerName !== playerName) {
+            const hidden = await hasUserMutedTarget(
+                serverId,
+                { playerName, userId: sock.meta?.userId || 0 },
+                { playerName: payload.playerName, userId: payload.userId || 0 }
+            );
+            if (hidden) {
+                out = { ...payload, text: MASKED_MESSAGE_TEXT };
+            }
+        }
+        sendChatWs(sock, out);
+    }
+}
+
 robloxChatWsServer.on('connection', (ws) => {
     ws.meta = null;
     ws.isAlive = true;
@@ -2391,6 +2663,7 @@ robloxChatWsServer.on('connection', (ws) => {
             cleanupChatClients();
             cleanupPrivateRooms();
             cleanupPrivateInvites();
+            cleanupGroupInvites();
             const msg = JSON.parse(raw.toString());
             const type = msg && msg.type;
 
@@ -2427,12 +2700,19 @@ robloxChatWsServer.on('connection', (ws) => {
                 } catch (_) {
                     privateRooms = [];
                 }
+                let groupRooms = [];
+                try {
+                    groupRooms = await fetchGroupRoomIndexForViewer(serverId, ws.meta, 25);
+                } catch (_) {
+                    groupRooms = [];
+                }
                 sendChatWs(ws, {
                     type: 'registered',
                     serverId,
                     playerName,
                     history,
-                    privateRooms
+                    privateRooms,
+                    groupRooms
                 });
 
                 // Deliver pending private invites that were created while this player wasn't connected yet.
@@ -2450,6 +2730,30 @@ robloxChatWsServer.on('connection', (ws) => {
                         sendChatWs(ws, {
                             type: 'private_invite',
                             inviteId: invite.id,
+                            fromName: invite.fromName,
+                            fromDisplayName: invite.fromDisplayName
+                        });
+                    }
+                } catch (_) {}
+
+                // Deliver pending group invites that were created while this player wasn't connected yet.
+                try {
+                    const now = Date.now();
+                    const receiverLower = usernameLower(playerName);
+                    for (const invite of pendingGroupInvites.values()) {
+                        if (!invite) continue;
+                        if (invite.serverId !== serverId) continue;
+                        if (usernameLower(invite.toName) !== receiverLower) continue;
+                        if (now - (invite.createdAt || now) > GROUP_INVITE_TTL_MS) continue;
+                        if (Array.isArray(invite.deliveredToLower) && invite.deliveredToLower.includes(receiverLower)) continue;
+                        invite.deliveredToLower = Array.isArray(invite.deliveredToLower) ? invite.deliveredToLower : [];
+                        invite.deliveredToLower.push(receiverLower);
+                        sendChatWs(ws, {
+                            type: 'group_invite',
+                            inviteId: invite.id,
+                            mode: invite.mode,
+                            roomId: invite.roomId || null,
+                            roomName: invite.roomName || 'Group Room',
                             fromName: invite.fromName,
                             fromDisplayName: invite.fromDisplayName
                         });
@@ -2901,7 +3205,551 @@ robloxChatWsServer.on('connection', (ws) => {
                 return;
             }
 
-            if (type === 'private_close') {
+            if (type === 'group_room_create') {
+                const targetName = String(msg.targetName || '').trim();
+                const roomName = String(msg.roomName || '').trim();
+                if (!targetName) {
+                    sendChatWs(ws, { type: 'error', message: 'missing target' });
+                    return;
+                }
+                if (usernameLower(targetName) === usernameLower(ws.meta.playerName)) {
+                    sendChatWs(ws, { type: 'error', message: 'cannot create room with yourself' });
+                    return;
+                }
+                try {
+                    const blocked = await isPrivateBlocked(ws.meta, { targetName });
+                    if (blocked) {
+                        sendChatWs(ws, { type: 'error', message: 'blocked' });
+                        return;
+                    }
+                } catch (_) {}
+
+                const inviteId = makeGroupInviteId(ws.meta.serverId, ws.meta.playerName, targetName);
+                const invite = {
+                    id: inviteId,
+                    mode: 'create',
+                    serverId: ws.meta.serverId,
+                    roomId: null,
+                    roomName: roomName || 'Group Room',
+                    fromName: ws.meta.playerName,
+                    fromDisplayName: ws.meta.displayName,
+                    toName: targetName,
+                    createdAt: Date.now(),
+                    deliveredToLower: []
+                };
+                pendingGroupInvites.set(inviteId, invite);
+
+                sendChatWs(ws, { type: 'group_invite_sent', inviteId, targetName, mode: 'create', roomName: invite.roomName });
+                const otherSock = chatSocketOf(ws.meta.serverId, targetName);
+                if (otherSock) {
+                    sendChatWs(otherSock, {
+                        type: 'group_invite',
+                        inviteId,
+                        mode: 'create',
+                        roomId: null,
+                        roomName: invite.roomName,
+                        fromName: invite.fromName,
+                        fromDisplayName: invite.fromDisplayName
+                    });
+                }
+                return;
+            }
+
+            if (type === 'group_invite') {
+                const roomId = String(msg.roomId || '').trim();
+                const targetName = String(msg.targetName || '').trim();
+                if (!roomId || !isGroupRoomId(roomId) || !targetName) {
+                    sendChatWs(ws, { type: 'error', message: 'bad invite payload' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const role = await fetchGroupRoomViewerRole(roomId, ws.meta);
+                if (role !== 'leader' && role !== 'deputy') {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                try {
+                    const blocked = await isPrivateBlocked(ws.meta, { targetName });
+                    if (blocked) {
+                        sendChatWs(ws, { type: 'error', message: 'blocked' });
+                        return;
+                    }
+                } catch (_) {}
+
+                let roomName = 'Group Room';
+                try {
+                    const { data } = await supabase.from('group_rooms').select('name,server_id').eq('room_id', roomId).limit(1);
+                    if (Array.isArray(data) && data[0] && data[0].server_id === ws.meta.serverId) {
+                        roomName = String(data[0].name || roomName);
+                    }
+                } catch (_) {}
+
+                const inviteId = makeGroupInviteId(ws.meta.serverId, ws.meta.playerName, targetName);
+                const invite = {
+                    id: inviteId,
+                    mode: 'add',
+                    serverId: ws.meta.serverId,
+                    roomId,
+                    roomName,
+                    fromName: ws.meta.playerName,
+                    fromDisplayName: ws.meta.displayName,
+                    toName: targetName,
+                    createdAt: Date.now(),
+                    deliveredToLower: []
+                };
+                pendingGroupInvites.set(inviteId, invite);
+
+                sendChatWs(ws, { type: 'group_invite_sent', inviteId, targetName, mode: 'add', roomId, roomName });
+                const otherSock = chatSocketOf(ws.meta.serverId, targetName);
+                if (otherSock) {
+                    sendChatWs(otherSock, {
+                        type: 'group_invite',
+                        inviteId,
+                        mode: 'add',
+                        roomId,
+                        roomName,
+                        fromName: invite.fromName,
+                        fromDisplayName: invite.fromDisplayName
+                    });
+                }
+                return;
+            }
+
+            if (type === 'group_invite_response') {
+                const inviteId = String(msg.inviteId || '').trim();
+                const accepted = !!msg.accepted;
+                const invite = pendingGroupInvites.get(inviteId);
+                if (!invite) {
+                    sendChatWs(ws, { type: 'error', message: 'invite not found' });
+                    return;
+                }
+                if (invite.serverId !== ws.meta.serverId) {
+                    sendChatWs(ws, { type: 'error', message: 'invite not found' });
+                    return;
+                }
+                if (usernameLower(invite.toName) !== usernameLower(ws.meta.playerName)) {
+                    sendChatWs(ws, { type: 'error', message: 'invite not found' });
+                    return;
+                }
+
+                pendingGroupInvites.delete(inviteId);
+
+                const inviterSock = chatSocketOf(ws.meta.serverId, invite.fromName);
+                if (!accepted) {
+                    if (inviterSock) {
+                        sendChatWs(inviterSock, {
+                            type: 'group_invite_declined',
+                            inviteId,
+                            targetName: ws.meta.playerName,
+                            mode: invite.mode
+                        });
+                    }
+                    sendChatWs(ws, { type: 'group_invite_declined_ack', inviteId, fromName: invite.fromName });
+                    return;
+                }
+
+                if (invite.mode === 'create') {
+                    let created;
+                    try {
+                        const inviterMeta = bestEffortMetaOf(ws.meta.serverId, invite.fromName);
+                        created = await createGroupRoom(ws.meta.serverId, inviterMeta, invite.roomName, ws.meta);
+                    } catch (err) {
+                        sendChatWs(ws, { type: 'error', message: String(err?.message || 'create room failed') });
+                        return;
+                    }
+
+                    const payloadForInvitee = {
+                        type: 'group_joined',
+                        roomId: created.roomId,
+                        roomName: created.roomName,
+                        role: 'member'
+                    };
+                    sendChatWs(ws, payloadForInvitee);
+
+                    if (inviterSock) {
+                        sendChatWs(inviterSock, {
+                            type: 'group_room_created',
+                            roomId: created.roomId,
+                            roomName: created.roomName,
+                            role: 'leader',
+                            targetName: ws.meta.playerName
+                        });
+                    }
+
+                    // Broadcast member list update to both sides (best effort).
+                    try {
+                        const members = await fetchGroupRoomMembers(created.roomId);
+                        await broadcastGroupRoom(ws.meta.serverId, created.roomId, { type: 'group_members', roomId: created.roomId, members });
+                    } catch (_) {}
+                    return;
+                }
+
+                if (invite.mode === 'add') {
+                    const roomId = String(invite.roomId || '').trim();
+                    if (!roomId || !isGroupRoomId(roomId)) {
+                        sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                        return;
+                    }
+                    const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                    if (access) {
+                        // Already in room.
+                        sendChatWs(ws, { type: 'group_joined', roomId, roomName: invite.roomName, role: await fetchGroupRoomViewerRole(roomId, ws.meta) });
+                        return;
+                    }
+                    try {
+                        await upsertGroupRoomMember(roomId, ws.meta, 'member');
+                    } catch (err) {
+                        sendChatWs(ws, { type: 'error', message: String(err?.message || 'join failed') });
+                        return;
+                    }
+
+                    sendChatWs(ws, { type: 'group_joined', roomId, roomName: invite.roomName, role: 'member' });
+                    try {
+                        const members = await fetchGroupRoomMembers(roomId);
+                        await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_member_joined', roomId, playerName: ws.meta.playerName });
+                        await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_members', roomId, members });
+                    } catch (_) {}
+                    return;
+                }
+                sendChatWs(ws, { type: 'error', message: 'bad invite mode' });
+                return;
+            }
+
+            if (type === 'group_history_request') {
+                const roomId = String(msg.roomId || '').trim();
+                if (!roomId || !isGroupRoomId(roomId)) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                let history = [];
+                try {
+                    history = await fetchGroupRoomHistory(roomId, 50);
+                } catch (_) {
+                    history = [];
+                }
+                sendChatWs(ws, { type: 'group_history', roomId, history });
+                return;
+            }
+
+            if (type === 'group_members_request') {
+                const roomId = String(msg.roomId || '').trim();
+                if (!roomId || !isGroupRoomId(roomId)) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                let members = [];
+                try {
+                    members = await fetchGroupRoomMembers(roomId);
+                } catch (_) {
+                    members = [];
+                }
+                sendChatWs(ws, { type: 'group_members', roomId, members });
+                return;
+            }
+
+            if (type === 'group_room_rename') {
+                const roomId = String(msg.roomId || '').trim();
+                const roomName = String(msg.roomName || '').trim().slice(0, 48);
+                if (!roomId || !isGroupRoomId(roomId) || !roomName) {
+                    sendChatWs(ws, { type: 'error', message: 'bad rename payload' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const role = await fetchGroupRoomViewerRole(roomId, ws.meta);
+                if (role !== 'leader') {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                try {
+                    const { error } = await supabase
+                        .from('group_rooms')
+                        .update({ name: roomName, updated_at: new Date().toISOString() })
+                        .eq('room_id', roomId)
+                        .eq('server_id', ws.meta.serverId);
+                    if (error) throw error;
+                } catch (err) {
+                    sendChatWs(ws, { type: 'error', message: String(err?.message || 'rename failed') });
+                    return;
+                }
+                await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_room_renamed', roomId, roomName, by: ws.meta.playerName });
+                return;
+            }
+
+            if (type === 'group_member_kick') {
+                const roomId = String(msg.roomId || '').trim();
+                const targetName = String(msg.targetName || '').trim();
+                if (!roomId || !isGroupRoomId(roomId) || !targetName) {
+                    sendChatWs(ws, { type: 'error', message: 'bad kick payload' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const role = await fetchGroupRoomViewerRole(roomId, ws.meta);
+                if (role !== 'leader' && role !== 'deputy') {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                // Determine target user_key by name.
+                const targetLower = usernameLower(targetName);
+                let targetRow = null;
+                try {
+                    const { data } = await supabase
+                        .from('group_room_members')
+                        .select('user_key,player_name,role')
+                        .eq('room_id', roomId)
+                        .limit(100);
+                    targetRow = (data || []).find((r) => usernameLower(r.player_name) === targetLower) || null;
+                } catch (_) {}
+                if (!targetRow) {
+                    sendChatWs(ws, { type: 'error', message: 'target not found' });
+                    return;
+                }
+                if (String(targetRow.role || '') === 'leader') {
+                    sendChatWs(ws, { type: 'error', message: 'cannot kick leader' });
+                    return;
+                }
+                if (role === 'deputy' && String(targetRow.role || '') === 'deputy') {
+                    sendChatWs(ws, { type: 'error', message: 'cannot kick deputy' });
+                    return;
+                }
+                try {
+                    const { error } = await supabase
+                        .from('group_room_members')
+                        .delete()
+                        .eq('room_id', roomId)
+                        .eq('user_key', targetRow.user_key);
+                    if (error) throw error;
+                } catch (err) {
+                    sendChatWs(ws, { type: 'error', message: String(err?.message || 'kick failed') });
+                    return;
+                }
+                const kickedSock = chatSocketOf(ws.meta.serverId, targetName);
+                if (kickedSock) {
+                    sendChatWs(kickedSock, { type: 'group_kicked', roomId, by: ws.meta.playerName });
+                }
+                await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_member_left', roomId, playerName: targetName, by: ws.meta.playerName });
+                return;
+            }
+
+            if (type === 'group_promote_deputy') {
+                const roomId = String(msg.roomId || '').trim();
+                const targetName = String(msg.targetName || '').trim();
+                if (!roomId || !isGroupRoomId(roomId) || !targetName) {
+                    sendChatWs(ws, { type: 'error', message: 'bad promote payload' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const role = await fetchGroupRoomViewerRole(roomId, ws.meta);
+                if (role !== 'leader') {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                const targetLower = usernameLower(targetName);
+                let targetRow = null;
+                try {
+                    const { data } = await supabase
+                        .from('group_room_members')
+                        .select('user_key,player_name,role')
+                        .eq('room_id', roomId)
+                        .limit(100);
+                    targetRow = (data || []).find((r) => usernameLower(r.player_name) === targetLower) || null;
+                } catch (_) {}
+                if (!targetRow) {
+                    sendChatWs(ws, { type: 'error', message: 'target not found' });
+                    return;
+                }
+                if (String(targetRow.role || '') === 'leader') {
+                    sendChatWs(ws, { type: 'error', message: 'leader already' });
+                    return;
+                }
+                try {
+                    await supabase.from('group_room_members').update({ role: 'member' }).eq('room_id', roomId).eq('role', 'deputy');
+                    const { error } = await supabase.from('group_room_members').update({ role: 'deputy' }).eq('room_id', roomId).eq('user_key', targetRow.user_key);
+                    if (error) throw error;
+                } catch (err) {
+                    sendChatWs(ws, { type: 'error', message: String(err?.message || 'promote failed') });
+                    return;
+                }
+                await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_role_changed', roomId, playerName: targetName, role: 'deputy', by: ws.meta.playerName });
+                return;
+            }
+
+            if (type === 'group_mute' || type === 'group_unmute') {
+                const roomId = String(msg.roomId || '').trim();
+                const targetName = String(msg.targetName || '').trim();
+                if (!roomId || !isGroupRoomId(roomId) || !targetName) {
+                    sendChatWs(ws, { type: 'error', message: 'bad mute payload' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const role = await fetchGroupRoomViewerRole(roomId, ws.meta);
+                if (role !== 'leader' && role !== 'deputy') {
+                    sendChatWs(ws, { type: 'error', message: 'forbidden' });
+                    return;
+                }
+                const targetMeta = bestEffortMetaOf(ws.meta.serverId, targetName);
+                const targetKey = policyUserKey(targetMeta.userId, targetMeta.playerName);
+                if (!targetKey) {
+                    sendChatWs(ws, { type: 'error', message: 'target not found' });
+                    return;
+                }
+
+                if (type === 'group_unmute') {
+                    try {
+                        await supabase.from('group_room_mutes').delete().eq('room_id', roomId).eq('target_user_key', targetKey);
+                    } catch (_) {}
+                    await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_unmuted', roomId, targetName, by: ws.meta.playerName });
+                    return;
+                }
+
+                const durationSec = Math.min(Math.max(Number(msg.durationSec || 600) || 600, 10), 7 * 24 * 3600);
+                const mutedUntil = new Date(Date.now() + durationSec * 1000).toISOString();
+                try {
+                    await supabase.from('group_room_mutes').upsert({
+                        room_id: roomId,
+                        target_user_key: targetKey,
+                        target_name: targetName,
+                        muted_by_key: policyUserKey(ws.meta.userId, ws.meta.playerName),
+                        muted_by_name: ws.meta.playerName,
+                        muted_until: mutedUntil
+                    }, { onConflict: 'room_id,target_user_key' });
+                } catch (err) {
+                    sendChatWs(ws, { type: 'error', message: String(err?.message || 'mute failed') });
+                    return;
+                }
+                const targetSock = chatSocketOf(ws.meta.serverId, targetName);
+                if (targetSock) {
+                    sendChatWs(targetSock, { type: 'group_muted', roomId, message: `You are muted in this room.` });
+                }
+                await broadcastGroupRoom(ws.meta.serverId, roomId, { type: 'group_muted_notice', roomId, targetName, by: ws.meta.playerName, mutedUntil });
+                return;
+            }
+            if (type === 'group_message') {
+                const roomId = String(msg.roomId || '').trim();
+                const rawText = sanitizeChatText(msg.text);
+                const replyTo = sanitizeReplyMeta(msg.replyTo);
+                if (!roomId || !isGroupRoomId(roomId)) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                if (!access) {
+                    sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                    return;
+                }
+                const muted = await isMutedInGroupRoom(roomId, ws.meta);
+                if (muted) {
+                    sendChatWs(ws, { type: 'group_muted', roomId, message: 'You are muted in this room.' });
+                    return;
+                }
+                if (!rawText) return;
+
+                const banState = await getBanState(ws.meta);
+                if (banState) {
+                    sendChatWs(ws, { type: 'moderation_muted', message: 'You are banned from chat.' });
+                    return;
+                }
+
+                const moderation = await evaluateOutgoingChat(ws.meta, rawText, { isPrivate: true });
+                if (moderation.blocked) {
+                    const detail = moderationBlockMessage(moderation);
+                    sendChatWs(ws, { type: 'moderation_muted', message: detail, strikeLevel: moderation.strikeLevel || 0 });
+                    return;
+                }
+
+                let text = moderation.text;
+                const adminMuteUntil = await getAdminMuteState(ws.meta);
+                const forceMaskByAdmin = !!adminMuteUntil;
+                if (forceMaskByAdmin) {
+                    text = MASKED_MESSAGE_TEXT;
+                }
+
+                const visual = moderation.warning
+                    ? {
+                        level: Number(moderation.warning.level || 1) || 1,
+                        style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
+                    }
+                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: true }));
+
+                const senderRole = await getChatRole(ws.meta.playerName);
+                const out = {
+                    id: String(Date.now()) + '_' + Math.random().toString(36).slice(2, 8),
+                    type: 'chat_message',
+                    channel: 'private',
+                    roomId,
+                    serverId: ws.meta.serverId,
+                    placeId: ws.meta.placeId,
+                    playerName: ws.meta.playerName,
+                    displayName: ws.meta.displayName,
+                    userId: ws.meta.userId,
+                    text,
+                    replyTo,
+                    level: visual.level,
+                    levelStyle: visual.style,
+                    senderRole,
+                    createdAt: new Date().toISOString()
+                };
+
+                await logChatMessageAudit({
+                    serverId: out.serverId,
+                    channel: out.channel,
+                    roomId: out.roomId,
+                    playerName: out.playerName,
+                    displayName: out.displayName,
+                    userId: out.userId,
+                    textOriginal: rawText,
+                    textSanitized: out.text,
+                    reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
+                    isMasked: forceMaskByAdmin
+                });
+
+                try {
+                    await saveGroupRoomMessage(out);
+                } catch (err) {
+                    console.error('[group] save history failed:', err?.message || err);
+                }
+
+                await broadcastGroupRoom(ws.meta.serverId, roomId, out);
+
+                if (moderation.warning) {
+                    const warnMsg = moderation.warning.justMuted
+                        ? (moderation.warning.permanentMute
+                            ? 'Message moderated. You are permanently muted.'
+                            : `Message moderated. You are muted ${formatMuteDuration(moderation.warning.muteUntil)}.`)
+                        : `Message moderated (##). Warning ${moderation.warning.warningCount}/${WARNING_LIMIT}.`;
+                    sendChatWs(ws, { type: 'moderation_warning', message: warnMsg });
+                }
+                return;
+            }if (type === 'private_close') {
                 const roomId = String(msg.roomId || '').trim();
                 const room = privateChatRooms.get(roomId);
                 if (!room || room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
@@ -2935,6 +3783,20 @@ robloxChatWsServer.on('connection', (ws) => {
                 if (otherSock) {
                     sendChatWs(otherSock, {
                         type: 'private_invite_cancelled',
+                        inviteId,
+                        playerName: ws.meta.playerName
+                    });
+                }
+            }
+            for (const [inviteId, invite] of pendingGroupInvites.entries()) {
+                if (!invite || invite.serverId !== ws.meta.serverId) continue;
+                if (invite.fromName !== ws.meta.playerName && invite.toName !== ws.meta.playerName) continue;
+                pendingGroupInvites.delete(inviteId);
+                const otherPlayer = invite.fromName === ws.meta.playerName ? invite.toName : invite.fromName;
+                const otherSock = chatSocketOf(ws.meta.serverId, otherPlayer);
+                if (otherSock) {
+                    sendChatWs(otherSock, {
+                        type: 'group_invite_cancelled',
                         inviteId,
                         playerName: ws.meta.playerName
                     });
@@ -4585,6 +5447,7 @@ app.post('/admin/refresh-token', (req, res) => {
         res.status(401).json({ error: 'Token không hợp lệ' });
     }
 });
+
 // Khởi động server
 server.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
