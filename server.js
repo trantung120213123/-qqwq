@@ -620,21 +620,50 @@ function applyLevelXpDelta(state, xpDelta) {
 
 async function getPlayerLevelState(meta) {
     const userKey = policyUserKey(meta.userId, meta.playerName);
+    const keys = policyUserKeys(meta.userId, meta.playerName);
     try {
         const { data, error } = await supabase
             .from('chat_player_levels')
-            .select('user_key,user_id,player_name,level,xp')
-            .eq('user_key', userKey)
-            .maybeSingle();
+            .select('user_key,user_id,player_name,level,xp,updated_at')
+            .in('user_key', keys);
         if (error) throw error;
-        if (!data) {
-            const initial = normalizeLevelState(meta, { level: 1, xp: 0 });
+
+        const rows = Array.isArray(data) ? data : (data ? [data] : []);
+        if (rows.length === 0) {
+            const initial = normalizeLevelState(meta, { user_key: userKey, level: 1, xp: 0 });
             await supabase
                 .from('chat_player_levels')
                 .upsert(initial, { onConflict: 'user_key' });
             return initial;
         }
-        return normalizeLevelState(meta, data);
+
+        // Pick the newest entry across uid/name keys (so offline /set using name key is honored).
+        let newest = rows[0];
+        let newestTs = new Date(rows[0].updated_at || 0).getTime();
+        if (!Number.isFinite(newestTs)) newestTs = 0;
+        for (let i = 1; i < rows.length; i++) {
+            const ts = new Date(rows[i].updated_at || 0).getTime();
+            const safeTs = Number.isFinite(ts) ? ts : 0;
+            if (safeTs >= newestTs) {
+                newest = rows[i];
+                newestTs = safeTs;
+            }
+        }
+        const normalized = normalizeLevelState(meta, newest);
+
+        // If we are now on uid key, migrate latest name-key level to uid key.
+        if (userKey && normalized.user_key !== userKey) {
+            await supabase
+                .from('chat_player_levels')
+                .upsert({
+                    user_key: userKey,
+                    user_id: meta.userId || null,
+                    player_name: meta.playerName || null,
+                    level: normalized.level,
+                    xp: normalized.xp
+                }, { onConflict: 'user_key' });
+        }
+        return normalized;
     } catch (_) {
         return normalizeLevelState(meta, { level: 1, xp: 0 });
     }
@@ -1197,23 +1226,34 @@ async function executeSlashCommand(ws, text, context = {}) {
         }
         const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, nextLevel));
         const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
-        const payload = {
-            user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+        const payloads = [];
+        const nameKey = policyUserKey(0, targetMeta.playerName);
+        payloads.push({
+            user_key: nameKey,
             user_id: targetMeta.userId || null,
             player_name: targetMeta.playerName,
             level,
             xp: 0
-        };
+        });
+        if (Number(targetMeta.userId || 0) > 0) {
+            payloads.push({
+                user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+                user_id: targetMeta.userId || null,
+                player_name: targetMeta.playerName,
+                level,
+                xp: 0
+            });
+        }
         try {
             const { error } = await supabase
                 .from('chat_player_levels')
-                .upsert(payload, { onConflict: 'user_key' });
+                .upsert(payloads, { onConflict: 'user_key' });
             if (error) throw error;
         } catch (_) {
             sendChatWs(ws, { type: 'error', message: 'set level failed' });
             return { handled: true };
         }
-        sendChatWs(ws, { type: 'command_result', message: `Set ${payload.player_name} to level ${level}` });
+        sendChatWs(ws, { type: 'command_result', message: `Set ${targetMeta.playerName} to level ${level}` });
         return { handled: true };
     }
 
