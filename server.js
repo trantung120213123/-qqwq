@@ -1186,13 +1186,13 @@ async function executeSlashCommand(ws, text, context = {}) {
         return { handled: true };
     }
 
-    if (cmd === '/level') {
+    if (cmd === '/level' || cmd === '/set') {
         if (!requireAdmin()) return { handled: true };
         const levelRaw = String(parts[1] || '').trim();
         const targetName = normalizeUsernameInput(parts[2]);
         const nextLevel = Number.parseInt(levelRaw, 10);
         if (!Number.isFinite(nextLevel) || !targetName) {
-            sendChatWs(ws, { type: 'error', message: 'Usage: /level [1-10] username' });
+            sendChatWs(ws, { type: 'error', message: `Usage: ${cmd} [1-10] username` });
             return { handled: true };
         }
         const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, nextLevel));
@@ -1217,46 +1217,10 @@ async function executeSlashCommand(ws, text, context = {}) {
         return { handled: true };
     }
 
+    // /up deprecated -> use /set
     if (cmd === '/up') {
         if (!requireAdmin()) return { handled: true };
-        const deltaRaw = String(parts[1] || '').trim();
-        const targetName = normalizeUsernameInput(parts[2]);
-        const delta = Number.parseInt(deltaRaw, 10);
-        if (!Number.isFinite(delta) || !targetName) {
-            sendChatWs(ws, { type: 'error', message: 'Usage: /up [delta] username' });
-            return { handled: true };
-        }
-        const targetMeta = findOnlineMeta(sender.serverId, targetName) || { playerName: targetName, userId: 0 };
-        const userKey = policyUserKey(targetMeta.userId, targetMeta.playerName);
-        let currentLevel = 1;
-        try {
-            const { data, error } = await supabase
-                .from('chat_player_levels')
-                .select('level')
-                .eq('user_key', userKey)
-                .limit(1);
-            if (!error && Array.isArray(data) && data[0] && Number.isFinite(Number(data[0].level))) {
-                currentLevel = Number(data[0].level);
-            }
-        } catch (_) {}
-        const nextLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, currentLevel + delta));
-        const payload = {
-            user_key: userKey,
-            user_id: targetMeta.userId || null,
-            player_name: targetMeta.playerName,
-            level: nextLevel,
-            xp: 0
-        };
-        try {
-            const { error } = await supabase
-                .from('chat_player_levels')
-                .upsert(payload, { onConflict: 'user_key' });
-            if (error) throw error;
-        } catch (_) {
-            sendChatWs(ws, { type: 'error', message: 'up level failed' });
-            return { handled: true };
-        }
-        sendChatWs(ws, { type: 'command_result', message: `Up ${payload.player_name} by ${delta} -> level ${nextLevel}` });
+        sendChatWs(ws, { type: 'error', message: 'Use /set [1-10] username' });
         return { handled: true };
     }
 
@@ -4160,7 +4124,7 @@ app.post('/api/chat/command', async (req, res) => {
 
         // Allow admin-only level commands via HTTP (client uses request like /mute).
         const cmd = rawText.split(/\s+/)[0]?.toLowerCase?.() || '';
-        if (cmd !== '/level' && cmd !== '/up') {
+        if (cmd !== '/level' && cmd !== '/set') {
             return res.status(400).json({ success: false, message: 'unsupported command for HTTP' });
         }
 
@@ -4169,13 +4133,13 @@ app.post('/api/chat/command', async (req, res) => {
             return res.status(403).json({ success: false, message: 'forbidden command (admin only)' });
         }
 
-        if (cmd === '/level') {
+        if (cmd === '/level' || cmd === '/set') {
             const parts = rawText.split(/\s+/);
             const levelRaw = String(parts[1] || '').trim();
             const targetName = normalizeUsernameInput(parts[2]);
             const nextLevel = Number.parseInt(levelRaw, 10);
             if (!Number.isFinite(nextLevel) || !targetName) {
-                return res.status(400).json({ success: false, message: 'Usage: /level [1-10] username' });
+                return res.status(400).json({ success: false, message: `Usage: ${cmd} [1-10] username` });
             }
             const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, nextLevel));
             const targetMeta = findOnlineMeta(senderMeta.serverId, targetName) || { playerName: targetName, userId: 0 };
@@ -4195,47 +4159,6 @@ app.post('/api/chat/command', async (req, res) => {
                 return res.status(500).json({ success: false, message: 'set level failed' });
             }
             return res.json({ success: true, data: { message: `Set ${payload.player_name} to level ${level}` } });
-        }
-
-        // cmd === '/up'
-        {
-            const parts = rawText.split(/\s+/);
-            const deltaRaw = String(parts[1] || '').trim();
-            const targetName = normalizeUsernameInput(parts[2]);
-            const delta = Number.parseInt(deltaRaw, 10);
-            if (!Number.isFinite(delta) || !targetName) {
-                return res.status(400).json({ success: false, message: 'Usage: /up [delta] username' });
-            }
-            const targetMeta = findOnlineMeta(senderMeta.serverId, targetName) || { playerName: targetName, userId: 0 };
-            const userKey = policyUserKey(targetMeta.userId, targetMeta.playerName);
-            let currentLevel = 1;
-            try {
-                const { data, error } = await supabase
-                    .from('chat_player_levels')
-                    .select('level')
-                    .eq('user_key', userKey)
-                    .limit(1);
-                if (!error && Array.isArray(data) && data[0] && Number.isFinite(Number(data[0].level))) {
-                    currentLevel = Number(data[0].level);
-                }
-            } catch (_) {}
-            const nextLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, currentLevel + delta));
-            const payload = {
-                user_key: userKey,
-                user_id: targetMeta.userId || null,
-                player_name: targetMeta.playerName,
-                level: nextLevel,
-                xp: 0
-            };
-            try {
-                const { error } = await supabase
-                    .from('chat_player_levels')
-                    .upsert(payload, { onConflict: 'user_key' });
-                if (error) throw error;
-            } catch (_) {
-                return res.status(500).json({ success: false, message: 'up level failed' });
-            }
-            return res.json({ success: true, data: { message: `Up ${payload.player_name} by ${delta} -> level ${nextLevel}` } });
         }
     } catch (err) {
         return res.status(500).json({ success: false, message: 'internal server error' });
