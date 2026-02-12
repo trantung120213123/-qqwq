@@ -2121,6 +2121,116 @@ async function persistPublicChatMessage(out) {
     }
 }
 
+async function savePrivateRoomMessage(out) {
+    const payload = {
+        room_id: String(out.roomId || '').trim(),
+        server_id: String(out.serverId || '').trim(),
+        place_id: out.placeId || null,
+        player_name: String(out.playerName || '').trim(),
+        display_name: String(out.displayName || '').trim() || String(out.playerName || '').trim(),
+        user_id: out.userId || null,
+        text: String(out.text || ''),
+        reply_to: out.replyTo || null,
+        sender_level: Number(out.level || 1) || 1,
+        sender_style: String(out.levelStyle || levelStyleName(out.level || 1)),
+        sender_role: String(out.senderRole || 'user')
+    };
+    if (!payload.room_id) return;
+    const { error } = await supabase.from('private_room_messages').insert(payload);
+    if (error) throw error;
+}
+
+async function fetchPrivateRoomHistory(roomId, limit = 50) {
+    const safeId = String(roomId || '').trim();
+    if (!safeId) return [];
+    const safeLimit = Math.min(Math.max(Number(limit || 50) || 50, 1), 50);
+    const { data, error } = await supabase
+        .from('private_room_messages')
+        .select('*')
+        .eq('room_id', safeId)
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .limit(safeLimit);
+    if (error) throw error;
+    return (data || []).map((row) => ({
+        id: row.id,
+        type: 'chat_message',
+        channel: 'private',
+        roomId: row.room_id,
+        serverId: row.server_id,
+        placeId: row.place_id,
+        playerName: row.player_name,
+        displayName: row.display_name || row.player_name,
+        userId: row.user_id || 0,
+        text: row.text,
+        replyTo: row.reply_to || null,
+        level: isOwnerName(row.player_name) ? MAX_CHAT_LEVEL : (Number(row.sender_level || 1) || 1),
+        levelStyle: isOwnerName(row.player_name)
+            ? levelStyleName(MAX_CHAT_LEVEL)
+            : String(row.sender_style || levelStyleName(Number(row.sender_level || 1))),
+        senderRole: isOwnerName(row.player_name)
+            ? 'admin'
+            : String(row.sender_role || 'user'),
+        createdAt: row.created_at || new Date().toISOString()
+    }));
+}
+
+function bestEffortMetaOf(serverId, playerName) {
+    const sock = chatSocketOf(serverId, playerName);
+    if (sock && sock.meta) return sock.meta;
+    return {
+        key: chatClientKey(serverId, playerName),
+        serverId: String(serverId || '').trim(),
+        placeId: 0,
+        playerName: String(playerName || '').trim(),
+        displayName: String(playerName || '').trim(),
+        userId: 0
+    };
+}
+
+async function upsertPrivateRoomIndexForViewer(serverId, viewerMeta, roomId, targetName, roomName) {
+    const payload = {
+        user_key: policyUserKey(viewerMeta.userId, viewerMeta.playerName),
+        server_id: String(serverId || '').trim(),
+        room_id: String(roomId || '').trim(),
+        target_name: String(targetName || '').trim(),
+        room_name: String(roomName || '').trim()
+    };
+    if (!payload.user_key || !payload.room_id || !payload.server_id) return;
+    try {
+        await supabase.from('private_room_index').upsert(payload, { onConflict: 'user_key,room_id' });
+    } catch (err) {
+        console.error('[pm] room index upsert failed:', err?.message || err);
+    }
+}
+
+async function fetchPrivateRoomIndexForViewer(serverId, viewerMeta, limit = 25) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return [];
+    const safeLimit = Math.min(Math.max(Number(limit || 25) || 25, 1), 40);
+    const { data, error } = await supabase
+        .from('private_room_index')
+        .select('user_key,server_id,room_id,target_name,room_name,updated_at')
+        .in('user_key', keys)
+        .eq('server_id', String(serverId || '').trim())
+        .order('updated_at', { ascending: false })
+        .limit(safeLimit);
+    if (error) throw error;
+    const seen = new Set();
+    const out = [];
+    for (const row of (data || [])) {
+        if (!row || !row.room_id) continue;
+        if (seen.has(row.room_id)) continue;
+        seen.add(row.room_id);
+        out.push({
+            roomId: row.room_id,
+            targetName: row.target_name || '',
+            roomName: row.room_name || ''
+        });
+    }
+    return out;
+}
+
 function chatSocketOf(serverId, playerName) {
     const targetServer = String(serverId || '').trim();
     const targetLower = usernameLower(playerName);
@@ -2138,6 +2248,37 @@ function chatSocketOf(serverId, playerName) {
 function makePrivateRoomId(serverId, p1, p2) {
     const sorted = [String(p1 || '').trim(), String(p2 || '').trim()].sort();
     return `pm_${serverId}_${sorted[0]}_${sorted[1]}`;
+}
+
+function parsePrivateRoomId(roomId) {
+    const raw = String(roomId || '').trim();
+    if (!raw.startsWith('pm_')) return null;
+    // Format: pm_<serverId>_<p1>_<p2> (p1/p2 are raw names; this is legacy format, keep simple split).
+    const parts = raw.split('_');
+    if (parts.length < 4) return null;
+    const serverId = parts[1];
+    const p1 = parts[2];
+    const p2 = parts.slice(3).join('_'); // In case name contained underscores (rare), best-effort.
+    if (!serverId || !p1 || !p2) return null;
+    return { serverId, p1, p2 };
+}
+
+async function viewerHasPrivateRoomAccess(serverId, viewerMeta, roomId) {
+    const keys = policyUserKeys(viewerMeta.userId, viewerMeta.playerName);
+    if (!keys.length) return false;
+    try {
+        const { data, error } = await supabase
+            .from('private_room_index')
+            .select('room_id')
+            .in('user_key', keys)
+            .eq('server_id', String(serverId || '').trim())
+            .eq('room_id', String(roomId || '').trim())
+            .limit(1);
+        if (error) return false;
+        return Array.isArray(data) && data.length > 0;
+    } catch (_) {
+        return false;
+    }
 }
 
 function makePrivateInviteId(serverId, fromName, toName) {
@@ -2270,7 +2411,8 @@ robloxChatWsServer.on('connection', (ws) => {
                     placeId,
                     playerName,
                     displayName,
-                    userId
+                    userId,
+                    userKey: policyUserKey(userId, playerName)
                 };
                 chatClients.add(ws);
                 let history = [];
@@ -2279,11 +2421,18 @@ robloxChatWsServer.on('connection', (ws) => {
                 } catch (_) {
                     history = [];
                 }
+                let privateRooms = [];
+                try {
+                    privateRooms = await fetchPrivateRoomIndexForViewer(serverId, ws.meta, 25);
+                } catch (_) {
+                    privateRooms = [];
+                }
                 sendChatWs(ws, {
                     type: 'registered',
                     serverId,
                     playerName,
-                    history
+                    history,
+                    privateRooms
                 });
 
                 // Deliver pending private invites that were created while this player wasn't connected yet.
@@ -2597,7 +2746,16 @@ robloxChatWsServer.on('connection', (ws) => {
 
             if (type === 'private_message') {
                 const roomId = String(msg.roomId || '').trim();
-                const room = privateChatRooms.get(roomId);
+                let room = privateChatRooms.get(roomId);
+                if (!room) {
+                    const parsed = parsePrivateRoomId(roomId);
+                    const access = await viewerHasPrivateRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                    if (parsed && parsed.serverId === ws.meta.serverId && access) {
+                        if (parsed.p1 === ws.meta.playerName || parsed.p2 === ws.meta.playerName) {
+                            room = getOrCreatePrivateRoom(ws.meta.serverId, parsed.p1, parsed.p2);
+                        }
+                    }
+                }
                 if (!room || room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
                     sendChatWs(ws, { type: 'error', message: 'private room not found' });
                     return;
@@ -2678,6 +2836,21 @@ robloxChatWsServer.on('connection', (ws) => {
                     reasons: moderation.warning ? (moderation.warning.reasons || null) : null,
                     isMasked: forceMaskByAdmin
                 });
+                try {
+                    await savePrivateRoomMessage(out);
+                } catch (err) {
+                    console.error('[pm] save history failed:', err?.message || err);
+                }
+                try {
+                    const p1 = room.players.find((p) => p !== ws.meta.playerName) || '';
+                    const roomNameForSender = `PM ${p1}`;
+                    const roomNameForOther = `PM ${ws.meta.playerName}`;
+                    await upsertPrivateRoomIndexForViewer(room.serverId, ws.meta, roomId, p1, roomNameForSender);
+                    if (p1) {
+                        const otherMeta = bestEffortMetaOf(room.serverId, p1);
+                        await upsertPrivateRoomIndexForViewer(room.serverId, otherMeta, roomId, ws.meta.playerName, roomNameForOther);
+                    }
+                } catch (_) {}
                 await broadcastPrivateRoom(room, out);
                 if (moderation.warning) {
                     const warnMsg = moderation.warning.justMuted
@@ -2695,6 +2868,36 @@ robloxChatWsServer.on('connection', (ws) => {
                         reasons: moderation.warning.reasons || []
                     });
                 }
+                return;
+            }
+
+            if (type === 'private_history_request') {
+                const roomId = String(msg.roomId || '').trim();
+                const room = privateChatRooms.get(roomId);
+                if (!room) {
+                    const parsed = parsePrivateRoomId(roomId);
+                    const access = await viewerHasPrivateRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                    if (!parsed || parsed.serverId !== ws.meta.serverId || !access) {
+                        sendChatWs(ws, { type: 'error', message: 'private room not found' });
+                        return;
+                    }
+                    if (parsed.p1 !== ws.meta.playerName && parsed.p2 !== ws.meta.playerName) {
+                        sendChatWs(ws, { type: 'error', message: 'private room not found' });
+                        return;
+                    }
+                } else {
+                    if (room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
+                        sendChatWs(ws, { type: 'error', message: 'private room not found' });
+                        return;
+                    }
+                }
+                let history = [];
+                try {
+                    history = await fetchPrivateRoomHistory(roomId, 50);
+                } catch (_) {
+                    history = [];
+                }
+                sendChatWs(ws, { type: 'private_history', roomId, history });
                 return;
             }
 
