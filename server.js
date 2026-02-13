@@ -97,14 +97,90 @@ const MUTE_STEPS_MS = [
 const MAX_CHAT_LEVEL = 10;
 const LEVEL_XP_PUBLIC_MESSAGE = 4;
 const LEVEL_XP_PRIVATE_MESSAGE = 3;
+const XP_GAIN_RATIO_SERVER_CHAT = 1 / 10;
+const XP_GAIN_RATIO_ROOM_CHAT = 1 / 3;
 const LEVEL_XP_VIOLATION_PENALTY = 18;
 const LEVEL_XP_WARNING_PENALTY = 8;
 const XP_REWARD_WINDOW_MS = 10 * 1000;
 const XP_REPEAT_SAME_TEXT_MS = 900;
 const xpRewardStateByUser = new Map();
+const xpRewardCarryByUser = new Map();
+const heartReactionsByMessageId = new Map();
+const EIGHT_BALL_RESPONSES = [
+    'Yes.',
+    'No.',
+    'Maybe.',
+    'Ask again later.',
+    'Very likely.',
+    'Not today.',
+    'Absolutely.',
+    'Unclear for now.'
+];
+const CHAT_JOKE_RESPONSES = [
+    'Why did the bug hide? It did not want to be debugged.',
+    'I would tell a UDP joke, but you might not get it.',
+    'There are only 10 kinds of people: those who know binary and those who do not.',
+    '404 joke not found.',
+    'I had a joke about stack overflow, but it kept repeating.'
+];
 
 function nowMs() {
     return Date.now();
+}
+
+function reactionSetForMessage(messageId) {
+    const id = String(messageId || '').trim();
+    if (!id) return null;
+    if (!heartReactionsByMessageId.has(id)) {
+        heartReactionsByMessageId.set(id, new Set());
+    }
+    return heartReactionsByMessageId.get(id);
+}
+
+function getHeartCount(messageId) {
+    const set = reactionSetForMessage(messageId);
+    return set ? set.size : 0;
+}
+
+function decorateMessageWithReactions(message, viewerMeta = null) {
+    if (!message || typeof message !== 'object') return message;
+    const id = String(message.id || '').trim();
+    if (!id) {
+        return {
+            ...message,
+            heartCount: 0,
+            heartReacted: false
+        };
+    }
+    const set = reactionSetForMessage(id);
+    const viewerKey = viewerMeta ? policyUserKey(viewerMeta.userId, viewerMeta.playerName) : '';
+    return {
+        ...message,
+        heartCount: set ? set.size : 0,
+        heartReacted: !!(set && viewerKey && set.has(viewerKey))
+    };
+}
+
+function toggleHeartReaction(meta, messageId, activeRaw = null) {
+    const id = String(messageId || '').trim();
+    if (!id || !meta || !meta.playerName) return null;
+    const set = reactionSetForMessage(id);
+    if (!set) return null;
+    const actorKey = policyUserKey(meta.userId, meta.playerName);
+    const wantActive = activeRaw === null || activeRaw === undefined
+        ? !set.has(actorKey)
+        : !!activeRaw;
+    if (wantActive) {
+        set.add(actorKey);
+    } else {
+        set.delete(actorKey);
+    }
+    return {
+        messageId: id,
+        heartCount: set.size,
+        reacted: wantActive,
+        actorName: meta.playerName
+    };
 }
 
 function historyLoadLimitForChannel(channel, fallback = MAX_CHAT_HISTORY) {
@@ -688,14 +764,15 @@ async function savePlayerLevelState(state) {
 
 async function applyPlayerXp(meta, xpDelta) {
     if (!meta || !meta.playerName) {
-        return { level: 1, xp: 0, style: levelStyleName(1) };
+        return { level: 1, xp: 0, style: levelStyleName(1), previousLevel: 1, leveledUp: false };
     }
     if (await isAdminAccount(meta.playerName)) {
         const adminLevel = MAX_CHAT_LEVEL;
-        return { level: adminLevel, xp: 0, style: levelStyleName(adminLevel) };
+        return { level: adminLevel, xp: 0, style: levelStyleName(adminLevel), previousLevel: adminLevel, leveledUp: false };
     }
 
     const current = await getPlayerLevelState(meta);
+    const previousLevel = Number(current.level || 1) || 1;
     const next = applyLevelXpDelta(current, xpDelta);
     next.user_id = meta.userId || next.user_id || null;
     next.player_name = meta.playerName || next.player_name || null;
@@ -703,7 +780,9 @@ async function applyPlayerXp(meta, xpDelta) {
     return {
         level: next.level,
         xp: next.xp,
-        style: levelStyleName(next.level)
+        style: levelStyleName(next.level),
+        previousLevel,
+        leveledUp: Number(next.level || 1) > previousLevel
     };
 }
 
@@ -742,6 +821,32 @@ function calculateMessageXpGain(meta, text, options = {}) {
     prev.lastText = normalized;
     xpRewardStateByUser.set(key, prev);
     return reward;
+}
+
+function randomFromList(items, fallback = '') {
+    if (!Array.isArray(items) || items.length === 0) return fallback;
+    const index = Math.floor(Math.random() * items.length);
+    return String(items[index] || fallback);
+}
+
+function xpRatioForScope(scopeRaw) {
+    const scope = String(scopeRaw || '').trim().toLowerCase();
+    if (scope === 'server') return XP_GAIN_RATIO_SERVER_CHAT;
+    if (scope === 'room' || scope === 'private') return XP_GAIN_RATIO_ROOM_CHAT;
+    return 1;
+}
+
+function calculateScopedMessageXpGain(meta, text, options = {}) {
+    const baseGain = calculateMessageXpGain(meta, text, options);
+    const ratio = xpRatioForScope(options.scope || (options.isPrivate ? 'room' : 'public'));
+    if (ratio >= 1) return Math.max(0, Number(baseGain || 0));
+
+    const key = policyUserKey(meta && meta.userId, meta && meta.playerName);
+    const carry = Number(xpRewardCarryByUser.get(key) || 0);
+    const scaled = (Number(baseGain || 0) * ratio) + carry;
+    const gain = Math.floor(scaled);
+    xpRewardCarryByUser.set(key, Math.max(0, scaled - gain));
+    return Math.max(0, gain);
 }
 
 function calculateViolationPenalty(basePenalty, level, reasons, strikeLevel) {
@@ -1215,6 +1320,47 @@ async function executeSlashCommand(ws, text, context = {}) {
             type: muteCmd.ok ? 'command_result' : 'error',
             message: muteCmd.message
         });
+        return { handled: true };
+    }
+
+    if (cmd === '/help') {
+        const lines = [
+            'Fun: /roll [max], /flip, /8ball [question], /joke',
+            'Staff: /tempmute /mute /unsmute /warn /set /addmod /unmod /listmod /history',
+            'XP ratio: server=1/10, room=1/3'
+        ];
+        sendChatWs(ws, { type: 'command_result', message: lines.join(' | ') });
+        return { handled: true };
+    }
+
+    if (cmd === '/roll') {
+        const maxRaw = Number.parseInt(String(parts[1] || ''), 10);
+        const max = Number.isFinite(maxRaw) ? Math.max(2, Math.min(9999, maxRaw)) : 100;
+        const value = 1 + Math.floor(Math.random() * max);
+        sendChatWs(ws, { type: 'command_result', message: `${sender.playerName} rolled ${value}/${max}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/flip') {
+        const coin = Math.random() < 0.5 ? 'Heads' : 'Tails';
+        sendChatWs(ws, { type: 'command_result', message: `${sender.playerName} flipped: ${coin}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/8ball') {
+        const question = String(parts.slice(1).join(' ') || '').trim();
+        if (!question) {
+            sendChatWs(ws, { type: 'error', message: 'Usage: /8ball your question' });
+            return { handled: true };
+        }
+        const answer = randomFromList(EIGHT_BALL_RESPONSES, 'Maybe.');
+        sendChatWs(ws, { type: 'command_result', message: `8ball: ${answer}` });
+        return { handled: true };
+    }
+
+    if (cmd === '/joke') {
+        const joke = randomFromList(CHAT_JOKE_RESPONSES, 'No joke right now.');
+        sendChatWs(ws, { type: 'command_result', message: joke });
         return { handled: true };
     }
 
@@ -2007,7 +2153,7 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
         }).slice(0, limit);
     }
 
-    return rows.reverse().map((row) => ({
+    return rows.reverse().map((row) => decorateMessageWithReactions({
         id: row.id,
         channel: normalizePublicChannel(row.channel, 'server'),
         serverId: row.server_id,
@@ -2039,7 +2185,7 @@ function dedupeMergedHistory(items) {
             : `mem:${item.serverId || ''}:${item.channel || ''}:${item.playerName || ''}:${item.userId || 0}:${item.createdAt || ''}:${item.text || ''}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        out.push(item);
+        out.push(decorateMessageWithReactions(item));
     }
     out.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
     return out;
@@ -2109,7 +2255,32 @@ async function broadcastPublicChat(payload) {
         if (!client || !client.meta) continue;
         if (payload.channel === 'server' && client.meta.serverId !== payload.serverId) continue;
         const perViewer = await buildViewerPayload(payload, client.meta);
-        sendChatWs(client, perViewer);
+        sendChatWs(client, decorateMessageWithReactions(perViewer, client.meta));
+    }
+}
+
+function broadcastPublicEvent(payload) {
+    cleanupChatClients();
+    for (const client of chatClients) {
+        if (!client || !client.meta) continue;
+        if (payload.channel === 'server' && client.meta.serverId !== payload.serverId) continue;
+        sendChatWs(client, payload);
+    }
+}
+
+function broadcastLevelUpNotice(serverId, playerName, level) {
+    const payload = {
+        type: 'level_up_notice',
+        serverId,
+        playerName: String(playerName || ''),
+        level: Number(level || 1) || 1,
+        createdAt: new Date().toISOString()
+    };
+    cleanupChatClients();
+    for (const client of chatClients) {
+        if (!client || !client.meta) continue;
+        if (String(client.meta.serverId || '') !== String(serverId || '')) continue;
+        sendChatWs(client, payload);
     }
 }
 
@@ -2155,7 +2326,7 @@ async function fetchPrivateRoomHistory(roomId, limit = 50) {
         .order('id', { ascending: true })
         .limit(safeLimit);
     if (error) throw error;
-    return (data || []).map((row) => ({
+    return (data || []).map((row) => decorateMessageWithReactions({
         id: row.id,
         type: 'chat_message',
         channel: 'private',
@@ -2421,7 +2592,7 @@ async function fetchGroupRoomHistory(roomId, limit = 50) {
         .order('id', { ascending: true })
         .limit(safeLimit);
     if (error) throw error;
-    return (data || []).map((row) => ({
+    return (data || []).map((row) => decorateMessageWithReactions({
         id: row.id,
         type: 'chat_message',
         channel: 'private',
@@ -2771,6 +2942,67 @@ robloxChatWsServer.on('connection', (ws) => {
                 return;
             }
 
+            if (type === 'chat_react') {
+                const reaction = String(msg.reaction || 'heart').trim().toLowerCase();
+                const messageId = String(msg.messageId || '').trim();
+                const roomId = String(msg.roomId || '').trim();
+                const channel = normalizePublicChannel(msg.channel, 'server');
+                if (!messageId || reaction !== 'heart') {
+                    sendChatWs(ws, { type: 'error', message: 'bad reaction payload' });
+                    return;
+                }
+                const toggled = toggleHeartReaction(ws.meta, messageId, msg.active);
+                if (!toggled) {
+                    sendChatWs(ws, { type: 'error', message: 'reaction failed' });
+                    return;
+                }
+                const payload = {
+                    type: 'chat_reaction',
+                    reaction: 'heart',
+                    messageId: toggled.messageId,
+                    heartCount: toggled.heartCount,
+                    reacted: toggled.reacted,
+                    actorName: ws.meta.playerName,
+                    channel: roomId ? 'private' : channel,
+                    roomId: roomId || null,
+                    serverId: ws.meta.serverId,
+                    createdAt: new Date().toISOString()
+                };
+                if (roomId) {
+                    if (isGroupRoomId(roomId)) {
+                        const access = await viewerHasGroupRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                        if (!access) {
+                            sendChatWs(ws, { type: 'error', message: 'group room not found' });
+                            return;
+                        }
+                        await broadcastGroupRoom(ws.meta.serverId, roomId, payload);
+                        return;
+                    }
+                    let room = privateChatRooms.get(roomId);
+                    if (!room) {
+                        const parsed = parsePrivateRoomId(roomId);
+                        const access = await viewerHasPrivateRoomAccess(ws.meta.serverId, ws.meta, roomId);
+                        if (parsed && parsed.serverId === ws.meta.serverId && access) {
+                            if (parsed.p1 === ws.meta.playerName || parsed.p2 === ws.meta.playerName) {
+                                room = getOrCreatePrivateRoom(ws.meta.serverId, parsed.p1, parsed.p2);
+                            }
+                        }
+                    }
+                    if (!room || room.serverId !== ws.meta.serverId || !isPlayerInRoom(room, ws.meta.playerName)) {
+                        sendChatWs(ws, { type: 'error', message: 'private room not found' });
+                        return;
+                    }
+                    await broadcastPrivateRoom(room, payload);
+                    return;
+                }
+                if (!PUBLIC_CHAT_CHANNELS.includes(channel)) {
+                    sendChatWs(ws, { type: 'error', message: 'invalid channel' });
+                    return;
+                }
+                broadcastPublicEvent(payload);
+                return;
+            }
+
             if (type === 'chat_message') {
                 const channel = normalizePublicChannel(msg.channel, 'server');
                 const rawText = sanitizeChatText(msg.text);
@@ -2816,10 +3048,10 @@ robloxChatWsServer.on('connection', (ws) => {
                         level: Number(moderation.warning.level || 1) || 1,
                         style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
                     }
-                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: false }));
+                    : await applyPlayerXp(ws.meta, calculateScopedMessageXpGain(ws.meta, rawText, { isPrivate: false, scope: channel === 'server' ? 'server' : 'public' }));
                 const senderRole = await getChatRole(ws.meta.playerName);
 
-                const out = {
+                const out = decorateMessageWithReactions({
                     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
                     type: 'chat_message',
                     channel,
@@ -2834,7 +3066,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     levelStyle: visual.style,
                     senderRole,
                     createdAt: new Date().toISOString()
-                };
+                });
 
                 await logChatMessageAudit({
                     serverId: out.serverId,
@@ -2857,6 +3089,21 @@ robloxChatWsServer.on('connection', (ws) => {
                 }
 
                 await broadcastPublicChat(out);
+                if (visual && visual.leveledUp) {
+                    if (Number(visual.level || 1) >= 8) {
+                        await broadcastSystemMessage(ws.meta.serverId, `[LEVEL UP] ${ws.meta.playerName} reached level ${visual.level}!`);
+                        broadcastLevelUpNotice(ws.meta.serverId, ws.meta.playerName, visual.level);
+                    } else {
+                        sendChatWs(ws, {
+                            type: 'level_up_notice',
+                            serverId: ws.meta.serverId,
+                            playerName: ws.meta.playerName,
+                            level: visual.level,
+                            selfOnly: true,
+                            createdAt: new Date().toISOString()
+                        });
+                    }
+                }
                 if (moderation.warning) {
                     const warnMsg = moderation.warning.justMuted
                         ? (moderation.warning.permanentMute
@@ -3108,10 +3355,10 @@ robloxChatWsServer.on('connection', (ws) => {
                         level: Number(moderation.warning.level || 1) || 1,
                         style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
                     }
-                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: true }));
+                    : await applyPlayerXp(ws.meta, calculateScopedMessageXpGain(ws.meta, rawText, { isPrivate: true, scope: 'room' }));
                 const senderRole = await getChatRole(ws.meta.playerName);
                 room.updatedAt = Date.now();
-                const out = {
+                const out = decorateMessageWithReactions({
                     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
                     type: 'chat_message',
                     channel: 'private',
@@ -3127,7 +3374,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     levelStyle: visual.style,
                     senderRole,
                     createdAt: new Date().toISOString()
-                };
+                });
                 await logChatMessageAudit({
                     serverId: out.serverId,
                     channel: out.channel,
@@ -3156,6 +3403,21 @@ robloxChatWsServer.on('connection', (ws) => {
                     }
                 } catch (_) {}
                 await broadcastPrivateRoom(room, out);
+                if (visual && visual.leveledUp) {
+                    if (Number(visual.level || 1) >= 8) {
+                        await broadcastSystemMessage(ws.meta.serverId, `[LEVEL UP] ${ws.meta.playerName} reached level ${visual.level}!`);
+                        broadcastLevelUpNotice(ws.meta.serverId, ws.meta.playerName, visual.level);
+                    } else {
+                        sendChatWs(ws, {
+                            type: 'level_up_notice',
+                            serverId: ws.meta.serverId,
+                            playerName: ws.meta.playerName,
+                            level: visual.level,
+                            selfOnly: true,
+                            createdAt: new Date().toISOString()
+                        });
+                    }
+                }
                 if (moderation.warning) {
                     const warnMsg = moderation.warning.justMuted
                         ? (moderation.warning.permanentMute
@@ -3698,10 +3960,10 @@ robloxChatWsServer.on('connection', (ws) => {
                         level: Number(moderation.warning.level || 1) || 1,
                         style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
                     }
-                    : await applyPlayerXp(ws.meta, calculateMessageXpGain(ws.meta, rawText, { isPrivate: true }));
+                    : await applyPlayerXp(ws.meta, calculateScopedMessageXpGain(ws.meta, rawText, { isPrivate: true, scope: 'room' }));
 
                 const senderRole = await getChatRole(ws.meta.playerName);
-                const out = {
+                const out = decorateMessageWithReactions({
                     id: String(Date.now()) + '_' + Math.random().toString(36).slice(2, 8),
                     type: 'chat_message',
                     channel: 'private',
@@ -3717,7 +3979,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     levelStyle: visual.style,
                     senderRole,
                     createdAt: new Date().toISOString()
-                };
+                });
 
                 await logChatMessageAudit({
                     serverId: out.serverId,
@@ -3739,6 +4001,21 @@ robloxChatWsServer.on('connection', (ws) => {
                 }
 
                 await broadcastGroupRoom(ws.meta.serverId, roomId, out);
+                if (visual && visual.leveledUp) {
+                    if (Number(visual.level || 1) >= 8) {
+                        await broadcastSystemMessage(ws.meta.serverId, `[LEVEL UP] ${ws.meta.playerName} reached level ${visual.level}!`);
+                        broadcastLevelUpNotice(ws.meta.serverId, ws.meta.playerName, visual.level);
+                    } else {
+                        sendChatWs(ws, {
+                            type: 'level_up_notice',
+                            serverId: ws.meta.serverId,
+                            playerName: ws.meta.playerName,
+                            level: visual.level,
+                            selfOnly: true,
+                            createdAt: new Date().toISOString()
+                        });
+                    }
+                }
 
                 if (moderation.warning) {
                     const warnMsg = moderation.warning.justMuted
@@ -4829,6 +5106,161 @@ app.post('/admin/chat/unban', authenticateRole(['admin', 'super_admin', 'owner']
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
 });
+
+app.get('/admin/chat/users', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const limit = Math.min(Math.max(Number(req.query?.limit || 200) || 200, 1), 500);
+        const q = String(req.query?.q || '').trim().toLowerCase();
+        const nowIso = new Date().toISOString();
+        const [levelsRes, mutesRes, bansRes] = await Promise.allSettled([
+            supabase
+                .from('chat_player_levels')
+                .select('user_key,user_id,player_name,level,xp,updated_at')
+                .order('updated_at', { ascending: false })
+                .limit(limit),
+            supabase
+                .from('mute_list')
+                .select('username,muted_by,muted_until,reason')
+                .gt('muted_until', nowIso)
+                .limit(1000),
+            supabase
+                .from('ban_list')
+                .select('username,username_lower,banned_by,banned_until,is_permanent,reason')
+                .limit(1000)
+        ]);
+
+        const rows = (levelsRes.status === 'fulfilled' && !levelsRes.value.error)
+            ? (levelsRes.value.data || [])
+            : [];
+        const activeMuteByName = new Map();
+        if (mutesRes.status === 'fulfilled' && !mutesRes.value.error) {
+            for (const item of (mutesRes.value.data || [])) {
+                const uname = usernameLower(item?.username || '');
+                if (!uname) continue;
+                activeMuteByName.set(uname, item);
+            }
+        }
+        const activeBanByName = new Map();
+        if (bansRes.status === 'fulfilled' && !bansRes.value.error) {
+            for (const item of (bansRes.value.data || [])) {
+                const untilMs = item?.banned_until ? new Date(item.banned_until).getTime() : 0;
+                const isActive = !!item?.is_permanent || (untilMs > Date.now());
+                if (!isActive) continue;
+                const uname = usernameLower(item?.username || item?.username_lower || '');
+                if (!uname) continue;
+                activeBanByName.set(uname, item);
+            }
+        }
+
+        const onlineByName = new Map();
+        for (const client of chatClients) {
+            if (!client || !client.meta || !client.meta.playerName) continue;
+            const uname = usernameLower(client.meta.playerName);
+            const arr = onlineByName.get(uname) || [];
+            arr.push(String(client.meta.serverId || ''));
+            onlineByName.set(uname, arr);
+        }
+
+        const out = [];
+        for (const row of rows) {
+            const playerName = String(row?.player_name || '').trim();
+            if (!playerName) continue;
+            const uname = usernameLower(playerName);
+            if (q && !uname.includes(q)) continue;
+            const mute = activeMuteByName.get(uname) || null;
+            const ban = activeBanByName.get(uname) || null;
+            const servers = onlineByName.get(uname) || [];
+            out.push({
+                playerName,
+                userId: Number(row?.user_id || 0) || 0,
+                level: Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(row?.level || 1) || 1)),
+                xp: Math.max(0, Number(row?.xp || 0) || 0),
+                updatedAt: row?.updated_at || null,
+                online: servers.length > 0,
+                onlineServers: [...new Set(servers)].filter(Boolean),
+                muted: !!mute,
+                muteUntil: mute?.muted_until || null,
+                mutedBy: mute?.muted_by || null,
+                muteReason: mute?.reason || null,
+                banned: !!ban,
+                bannedUntil: ban?.banned_until || null,
+                banPermanent: !!(ban && ban.is_permanent),
+                bannedBy: ban?.banned_by || null,
+                banReason: ban?.reason || null
+            });
+        }
+        return res.json({ success: true, data: out });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
+app.post('/admin/chat/set-level', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = normalizeUsernameInput(req.body?.username);
+        const levelRaw = Number.parseInt(String(req.body?.level || ''), 10);
+        if (!username || !Number.isFinite(levelRaw)) {
+            return res.status(400).json({ success: false, message: 'username and level are required' });
+        }
+        const level = Math.max(1, Math.min(MAX_CHAT_LEVEL, levelRaw));
+        const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
+        const payloads = [{
+            user_key: policyUserKey(0, targetMeta.playerName),
+            user_id: targetMeta.userId || null,
+            player_name: targetMeta.playerName,
+            level,
+            xp: 0
+        }];
+        if (Number(targetMeta.userId || 0) > 0) {
+            payloads.push({
+                user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+                user_id: targetMeta.userId || null,
+                player_name: targetMeta.playerName,
+                level,
+                xp: 0
+            });
+        }
+        const { error } = await supabase.from('chat_player_levels').upsert(payloads, { onConflict: 'user_key' });
+        if (error) throw error;
+        return res.json({ success: true, data: { username: targetMeta.playerName, level } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
+app.post('/admin/chat/level-delta', authenticateRole(['admin', 'super_admin', 'owner']), async (req, res) => {
+    try {
+        const username = normalizeUsernameInput(req.body?.username);
+        const deltaRaw = Number.parseInt(String(req.body?.delta || ''), 10);
+        if (!username || !Number.isFinite(deltaRaw) || deltaRaw === 0) {
+            return res.status(400).json({ success: false, message: 'username and non-zero delta are required' });
+        }
+        const targetMeta = findOnlineMeta('', username) || { playerName: username, userId: 0 };
+        const current = await getPlayerLevelState(targetMeta);
+        const nextLevel = Math.max(1, Math.min(MAX_CHAT_LEVEL, Number(current.level || 1) + deltaRaw));
+        const payloads = [{
+            user_key: policyUserKey(0, targetMeta.playerName),
+            user_id: targetMeta.userId || null,
+            player_name: targetMeta.playerName,
+            level: nextLevel,
+            xp: 0
+        }];
+        if (Number(targetMeta.userId || 0) > 0) {
+            payloads.push({
+                user_key: policyUserKey(targetMeta.userId, targetMeta.playerName),
+                user_id: targetMeta.userId || null,
+                player_name: targetMeta.playerName,
+                level: nextLevel,
+                xp: 0
+            });
+        }
+        const { error } = await supabase.from('chat_player_levels').upsert(payloads, { onConflict: 'user_key' });
+        if (error) throw error;
+        return res.json({ success: true, data: { username: targetMeta.playerName, level: nextLevel, delta: deltaRaw } });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
 app.post('/api/blackflash/invite', (req, res) => {
     try {
         cleanupBlackFlashSessions();
@@ -5067,10 +5499,10 @@ app.post('/api/chat/server/send', async (req, res) => {
                 level: Number(moderation.warning.level || 1) || 1,
                 style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
             }
-            : await applyPlayerXp(senderMeta, calculateMessageXpGain(senderMeta, rawText, { isPrivate: false }));
+            : await applyPlayerXp(senderMeta, calculateScopedMessageXpGain(senderMeta, rawText, { isPrivate: false, scope: 'server' }));
         const senderRole = await getChatRole(senderMeta.playerName);
 
-        const out = {
+        const out = decorateMessageWithReactions({
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             type: 'chat_message',
             channel: 'server',
@@ -5085,7 +5517,7 @@ app.post('/api/chat/server/send', async (req, res) => {
             levelStyle: visual.style,
             senderRole,
             createdAt: new Date().toISOString()
-        };
+        });
 
         try {
             await persistPublicChatMessage(out);
@@ -5105,6 +5537,10 @@ app.post('/api/chat/server/send', async (req, res) => {
             isMasked: forceMaskByAdmin
         });
         await broadcastPublicChat(out);
+        if (visual && visual.leveledUp && Number(visual.level || 1) >= 8) {
+            await broadcastSystemMessage(serverId, `[LEVEL UP] ${playerName} reached level ${visual.level}!`);
+            broadcastLevelUpNotice(serverId, playerName, visual.level);
+        }
         return res.json({
             success: true,
             data: out,
@@ -5154,10 +5590,10 @@ app.post('/api/chat/send', async (req, res) => {
                 level: Number(moderation.warning.level || 1) || 1,
                 style: String(moderation.warning.levelStyle || levelStyleName(moderation.warning.level || 1))
             }
-            : await applyPlayerXp(senderMeta, calculateMessageXpGain(senderMeta, rawText, { isPrivate: false }));
+            : await applyPlayerXp(senderMeta, calculateScopedMessageXpGain(senderMeta, rawText, { isPrivate: false, scope: channel === 'server' ? 'server' : 'public' }));
         const senderRole = await getChatRole(senderMeta.playerName);
 
-        const out = {
+        const out = decorateMessageWithReactions({
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             type: 'chat_message',
             channel,
@@ -5172,7 +5608,7 @@ app.post('/api/chat/send', async (req, res) => {
             levelStyle: visual.style,
             senderRole,
             createdAt: new Date().toISOString()
-        };
+        });
 
         try {
             await persistPublicChatMessage(out);
@@ -5192,6 +5628,10 @@ app.post('/api/chat/send', async (req, res) => {
             isMasked: forceMaskByAdmin
         });
         await broadcastPublicChat(out);
+        if (visual && visual.leveledUp && Number(visual.level || 1) >= 8) {
+            await broadcastSystemMessage(serverId, `[LEVEL UP] ${playerName} reached level ${visual.level}!`);
+            broadcastLevelUpNotice(serverId, playerName, visual.level);
+        }
 
         return res.json({
             success: true,
@@ -5272,6 +5712,60 @@ app.post('/api/chat/command', async (req, res) => {
         return res.status(500).json({ success: false, message: 'internal server error' });
     }
 });
+
+app.post('/api/chat/react', async (req, res) => {
+    try {
+        const serverId = String(req.body?.serverId || '').trim();
+        const playerName = String(req.body?.playerName || '').trim();
+        const userId = Number(req.body?.userId || 0) || 0;
+        const messageId = String(req.body?.messageId || '').trim();
+        const channel = normalizePublicChannel(req.body?.channel, 'server');
+        const roomId = String(req.body?.roomId || '').trim();
+        const reaction = String(req.body?.reaction || 'heart').trim().toLowerCase();
+        if (!serverId || !playerName || !messageId || reaction !== 'heart') {
+            return res.status(400).json({ success: false, message: 'missing serverId/playerName/messageId or invalid reaction' });
+        }
+        const actorMeta = buildSenderMeta({ serverId, placeId: 0, playerName, displayName: playerName, userId });
+        const toggled = toggleHeartReaction(actorMeta, messageId, req.body?.active);
+        if (!toggled) {
+            return res.status(500).json({ success: false, message: 'reaction failed' });
+        }
+        const payload = {
+            type: 'chat_reaction',
+            reaction: 'heart',
+            messageId: toggled.messageId,
+            heartCount: toggled.heartCount,
+            reacted: toggled.reacted,
+            actorName: actorMeta.playerName,
+            channel: roomId ? 'private' : channel,
+            roomId: roomId || null,
+            serverId,
+            createdAt: new Date().toISOString()
+        };
+        if (roomId) {
+            if (isGroupRoomId(roomId)) {
+                await broadcastGroupRoom(serverId, roomId, payload);
+            } else {
+                let room = privateChatRooms.get(roomId);
+                if (!room) {
+                    const parsed = parsePrivateRoomId(roomId);
+                    if (parsed && parsed.serverId === serverId) {
+                        room = getOrCreatePrivateRoom(serverId, parsed.p1, parsed.p2);
+                    }
+                }
+                if (room) {
+                    await broadcastPrivateRoom(room, payload);
+                }
+            }
+        } else {
+            broadcastPublicEvent(payload);
+        }
+        return res.json({ success: true, data: payload });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'internal server error' });
+    }
+});
+
 app.get('/api/chat/server/history', async (req, res) => {
     try {
         const serverId = String(req.query?.serverId || '').trim();
@@ -5428,7 +5922,7 @@ app.post('/admin/verify-token', (req, res) => {
         res.status(401).json({ error: 'Token không hợp lệ hoặc đã hết hạn' });
     }
 });
-// API refresh token (giữ nguyên)
+
 app.post('/admin/refresh-token', (req, res) => {
     const token = req.headers.authorization?.substring(7) || req.headers['x-access-token'] || req.query.token;
     try {
@@ -5448,7 +5942,7 @@ app.post('/admin/refresh-token', (req, res) => {
     }
 });
 
-// Khởi động server
+
 server.listen(PORT, () => {
     console.log(`🚀 Server đang chạy trên port ${PORT}`);
     console.log(`☁️ Supabase URL: ${SUPABASE_URL}`);
