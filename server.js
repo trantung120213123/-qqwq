@@ -132,6 +132,14 @@ function nowMs() {
     return Date.now();
 }
 
+function looksLikeRobloxJobId(value) {
+    const raw = String(value || '').trim();
+    if (raw.length !== 36) return false;
+    const hyphenCount = (raw.match(/-/g) || []).length;
+    if (hyphenCount < 4) return false;
+    return /^[a-f0-9-]+$/i.test(raw);
+}
+
 function reactionSetForMessage(messageId) {
     const id = String(messageId || '').trim();
     if (!id) return null;
@@ -2284,10 +2292,11 @@ function pushServerMemoryHistory(serverId, channel, message) {
 
 async function saveServerChatMessage(message) {
     const channel = normalizePublicChannel(message.channel, 'server');
+    const jobId = String(message.jobId || message.serverId || '').trim();
     const payload = {
         server_id: scopedHistoryServerId(message.serverId, channel),
         // Actual Roblox server JobId for teleport/join. `server_id` can be scoped (e.g. __shared_public__).
-        job_id: message.serverId || null,
+        job_id: jobId || null,
         channel: channel,
         place_id: message.placeId || null,
         player_name: message.playerName,
@@ -2372,11 +2381,15 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
         }).slice(0, limit);
     }
 
-    return rows.reverse().map((row) => decorateMessageWithReactions({
+    return rows.reverse().map((row) => {
+        const dbServerId = String(row.server_id || '').trim();
+        const dbJobId = String(row.job_id || '').trim();
+        const effectiveJobId = dbJobId || (looksLikeRobloxJobId(dbServerId) ? dbServerId : '');
+        return decorateMessageWithReactions({
         id: row.id,
         channel: normalizePublicChannel(row.channel, 'server'),
-        serverId: row.server_id,
-        jobId: row.job_id || null,
+        serverId: effectiveJobId || dbServerId,
+        jobId: effectiveJobId || null,
         placeId: row.place_id,
         playerName: row.player_name,
         displayName: row.display_name || row.player_name,
@@ -2391,7 +2404,8 @@ async function fetchServerChatHistory(serverId, channel = 'server', limit = MAX_
             ? 'admin'
             : String(row.sender_role || 'user'),
         createdAt: row.created_at || new Date().toISOString()
-    }));
+    });
+    });
 }
 
 function dedupeMergedHistory(items) {
@@ -3292,6 +3306,7 @@ robloxChatWsServer.on('connection', (ws) => {
                     type: 'chat_message',
                     channel,
                     serverId: ws.meta.serverId,
+                    jobId: ws.meta.serverId,
                     placeId: ws.meta.placeId,
                     playerName: ws.meta.playerName,
                     displayName: ws.meta.displayName,
@@ -5811,6 +5826,7 @@ app.post('/api/chat/server/send', async (req, res) => {
             type: 'chat_message',
             channel: 'server',
             serverId,
+            jobId: serverId,
             placeId,
             playerName,
             displayName,
@@ -5918,6 +5934,7 @@ app.post('/api/chat/send', async (req, res) => {
             type: 'chat_message',
             channel,
             serverId,
+            jobId: serverId,
             placeId,
             playerName,
             displayName,
